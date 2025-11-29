@@ -334,7 +334,7 @@ class FactArtifact(Artifact):
     
     def get_summary(self) -> str:
         """Return brief summary with status."""
-        return f"[Fact {status[self.validity_status]}] {self.claim[:80]}..."
+        return f"[Fact {self.validity_status.value}] {self.claim[:80]}..."
     
     def to_context_string(self) -> str:
         """Convert to LLM context string."""

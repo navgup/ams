@@ -27,13 +27,16 @@ import argparse
 import logging
 import pickle
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 
+import ast
+
 import dspy
+from dateutil import parser as dateutil_parser
 from tqdm import tqdm
 
 # Add parent directory to path for imports
@@ -101,6 +104,22 @@ def calculate_metrics(prediction: str, reference: str) -> Dict[str, float]:
         "exact_match": calculate_exact_match(prediction, reference),
         "f1": calculate_f1(prediction, reference),
     }
+
+
+def parse_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Parse ISO or free-form datetime strings and return naive UTC."""
+    if not value:
+        return None
+    try:
+        dt = dateutil_parser.isoparse(value)
+    except (ValueError, TypeError):
+        try:
+            dt = dateutil_parser.parse(value)
+        except (ValueError, TypeError):
+            return None
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=None)
 
 
 # ============================================================================
@@ -207,6 +226,7 @@ class AMSEvaluator:
         
         for session_id, session in sample.conversation.sessions.items():
             turn_count = 0
+            session_timestamp = parse_datetime(session.date_time)
             for turn in session.turns:
                 # Debug mode: limit turns per session
                 if self.max_turns_per_session > 0 and turn_count >= self.max_turns_per_session:
@@ -224,16 +244,7 @@ class AMSEvaluator:
                     if self.max_content_chars > 0:
                         content = content[:self.max_content_chars]
                     
-                    # Parse timestamp
-                    timestamp = None
-                    if session.date_time:
-                        try:
-                            timestamp = datetime.strptime(session.date_time, "%Y-%m-%d %H:%M:%S")
-                        except ValueError:
-                            try:
-                                timestamp = datetime.strptime(session.date_time, "%Y-%m-%d")
-                            except ValueError:
-                                pass
+                    timestamp = session_timestamp
                     
                     _, extracted = self.agent.ingest_conversation(
                         speaker=turn.speaker,
@@ -417,7 +428,7 @@ class AMEMEvaluator:
     
     def __init__(
         self,
-        model: str = "gpt-4o-mini",
+        model: str = "gpt-5-mini",
         backend: str = "openai",
         retrieve_k: int = 10,
         temperature_c5: float = 0.5,
@@ -429,6 +440,8 @@ class AMEMEvaluator:
         
         # Import A-MEM components
         try:
+            if not hasattr(ast, "Str"):
+                setattr(ast, "Str", str)
             sys.path.insert(0, str(Path(__file__).parent.parent / "a-mem"))
             from memory_layer import AgenticMemorySystem, LLMController
             self.AgenticMemorySystem = AgenticMemorySystem
@@ -787,7 +800,7 @@ Examples:
                         help="Random seed for question selection")
     
     # Model options
-    parser.add_argument("--model", type=str, default="gpt-4o-mini",
+    parser.add_argument("--model", type=str, default="gpt-5-mini",
                         help="Model to use")
     parser.add_argument("--backend", type=str, default="openai",
                         choices=["openai", "ollama"],
