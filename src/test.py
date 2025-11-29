@@ -44,66 +44,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "a-mem"))
 
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation, LoCoMoSample
 
+# Import metrics from a-mem utils (comprehensive: ROUGE, BLEU, BERT, METEOR, SBERT)
+from utils import calculate_metrics, aggregate_metrics as amem_aggregate_metrics
+
 # Import AMS components
 from schemas import QueryIntent
 from storage import ArtifactStore
 from agent import AMSAgent, create_ams_agent, create_ollama_agent
-
-
-# ============================================================================
-# Metrics (simplified version - can use a-mem/utils.py for full metrics)
-# ============================================================================
-
-def simple_tokenize(text: str) -> List[str]:
-    """Simple tokenization."""
-    text = str(text).lower()
-    for char in '.,:;!?"\'':
-        text = text.replace(char, ' ')
-    return text.split()
-
-
-def calculate_f1(prediction: str, reference: str) -> float:
-    """Calculate token-level F1 score."""
-    # Ensure strings
-    prediction = str(prediction) if prediction else ""
-    reference = str(reference) if reference else ""
-    
-    pred_tokens = set(simple_tokenize(prediction))
-    ref_tokens = set(simple_tokenize(reference))
-    
-    if not pred_tokens or not ref_tokens:
-        return 0.0
-    
-    common = pred_tokens & ref_tokens
-    precision = len(common) / len(pred_tokens) if pred_tokens else 0
-    recall = len(common) / len(ref_tokens) if ref_tokens else 0
-    
-    if precision + recall == 0:
-        return 0.0
-    return 2 * precision * recall / (precision + recall)
-
-
-def calculate_exact_match(prediction: str, reference: str) -> int:
-    """Calculate exact match (case-insensitive)."""
-    # Ensure strings
-    prediction = str(prediction) if prediction else ""
-    reference = str(reference) if reference else ""
-    return int(prediction.strip().lower() == reference.strip().lower())
-
-
-def calculate_metrics(prediction: str, reference: str) -> Dict[str, float]:
-    """Calculate evaluation metrics."""
-    # Convert None to empty string
-    prediction = str(prediction) if prediction else ""
-    reference = str(reference) if reference else ""
-    
-    if not prediction.strip() or not reference.strip():
-        return {"exact_match": 0, "f1": 0.0}
-    
-    return {
-        "exact_match": calculate_exact_match(prediction, reference),
-        "f1": calculate_f1(prediction, reference),
-    }
 
 
 def parse_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -363,7 +310,9 @@ class AMSEvaluator:
                 if self.debug:
                     log.info(f"  [DEBUG] Answer: {str(prediction)[:100]}...")
                     log.info(f"  [DEBUG] Reference: {str(reference)[:100]}...")
-                    log.info(f"  [DEBUG] F1={metrics['f1']:.3f}, EM={metrics['exact_match']}, Retrieved={retrieved}")
+                    log.info(f"  [DEBUG] F1={metrics.get('f1', 0):.3f}, EM={metrics.get('exact_match', 0)}, "
+                             f"BERT={metrics.get('bert_f1', 0):.3f}, SBERT={metrics.get('sbert_similarity', 0):.3f}, "
+                             f"Retrieved={retrieved}")
                 
                 result = QuestionResult(
                     sample_id=sample_idx,
@@ -389,34 +338,15 @@ class AMSEvaluator:
         return results
     
     def _aggregate_metrics(self, results: List[QuestionResult]) -> Dict[str, Dict[str, float]]:
-        """Aggregate metrics across all results."""
+        """Aggregate metrics across all results using a-mem's aggregate_metrics."""
         if not results:
             return {}
         
-        aggregates = {"overall": defaultdict(list)}
-        category_aggregates = defaultdict(lambda: defaultdict(list))
+        # Extract metrics and categories for a-mem's aggregate function
+        all_metrics = [r.metrics for r in results]
+        all_categories = [r.category for r in results]
         
-        for r in results:
-            for metric, value in r.metrics.items():
-                aggregates["overall"][metric].append(value)
-                category_aggregates[r.category][metric].append(value)
-        
-        def compute_stats(values: List[float]) -> Dict[str, float]:
-            if not values:
-                return {"mean": 0, "count": 0}
-            return {
-                "mean": sum(values) / len(values),
-                "count": len(values),
-            }
-        
-        result = {
-            "overall": {k: compute_stats(v) for k, v in aggregates["overall"].items()}
-        }
-        
-        for cat, metrics in category_aggregates.items():
-            result[f"category_{cat}"] = {k: compute_stats(v) for k, v in metrics.items()}
-        
-        return result
+        return amem_aggregate_metrics(all_metrics, all_categories)
 
 
 # ============================================================================
@@ -577,26 +507,14 @@ class AMEMEvaluator:
             return response
     
     def _aggregate_metrics(self, results: List[QuestionResult]) -> Dict[str, Dict[str, float]]:
-        """Same aggregation as AMS."""
+        """Aggregate metrics using a-mem's aggregate_metrics."""
         if not results:
             return {}
         
-        aggregates = {"overall": defaultdict(list)}
-        category_aggregates = defaultdict(lambda: defaultdict(list))
+        all_metrics = [r.metrics for r in results]
+        all_categories = [r.category for r in results]
         
-        for r in results:
-            for metric, value in r.metrics.items():
-                aggregates["overall"][metric].append(value)
-                category_aggregates[r.category][metric].append(value)
-        
-        def compute_stats(values):
-            return {"mean": sum(values) / len(values), "count": len(values)} if values else {"mean": 0, "count": 0}
-        
-        result = {"overall": {k: compute_stats(v) for k, v in aggregates["overall"].items()}}
-        for cat, metrics in category_aggregates.items():
-            result[f"category_{cat}"] = {k: compute_stats(v) for k, v in metrics.items()}
-        
-        return result
+        return amem_aggregate_metrics(all_metrics, all_categories)
 
 
 # ============================================================================
@@ -676,26 +594,35 @@ def print_comparison(ams_results: EvaluationResults, amem_results: Optional[Eval
     print("EVALUATION RESULTS")
     print("=" * 70)
     
+    # Key metrics to display (from a-mem utils.py)
+    KEY_METRICS = ["exact_match", "f1", "rouge1_f", "rougeL_f", "bleu1", "bert_f1", "meteor", "sbert_similarity"]
+    
     def print_system_results(results: EvaluationResults, name: str):
         print(f"\n{name} ({results.model})")
-        print("-" * 40)
+        print("-" * 60)
         print(f"Total questions: {results.total_questions}")
         
         if results.aggregate_metrics:
             overall = results.aggregate_metrics.get("overall", {})
-            f1 = overall.get("f1", {}).get("mean", 0)
-            em = overall.get("exact_match", {}).get("mean", 0)
-            print(f"Overall F1: {f1:.4f}")
-            print(f"Overall EM: {em:.4f}")
             
-            print("\nBy Category:")
+            # Print all key metrics
+            print("\nOverall Metrics:")
+            for metric in KEY_METRICS:
+                if metric in overall:
+                    val = overall[metric].get("mean", 0)
+                    print(f"  {metric:20s}: {val:.4f}")
+            
+            # Print by category (condensed)
+            print("\nBy Category (F1 / BERT-F1 / SBERT):")
             for cat in sorted(results.category_counts.keys()):
                 cat_key = f"category_{cat}"
                 if cat_key in results.aggregate_metrics:
-                    cat_f1 = results.aggregate_metrics[cat_key].get("f1", {}).get("mean", 0)
-                    cat_em = results.aggregate_metrics[cat_key].get("exact_match", {}).get("mean", 0)
+                    cat_metrics = results.aggregate_metrics[cat_key]
+                    cat_f1 = cat_metrics.get("f1", {}).get("mean", 0)
+                    cat_bert = cat_metrics.get("bert_f1", {}).get("mean", 0)
+                    cat_sbert = cat_metrics.get("sbert_similarity", {}).get("mean", 0)
                     count = results.category_counts[cat]
-                    print(f"  Cat {cat}: F1={cat_f1:.4f}, EM={cat_em:.4f} (n={count})")
+                    print(f"  Cat {cat}: {cat_f1:.3f} / {cat_bert:.3f} / {cat_sbert:.3f} (n={count})")
     
     print_system_results(ams_results, "AMS (Agent Memory Scaffolding)")
     
@@ -710,20 +637,24 @@ def print_comparison(ams_results: EvaluationResults, amem_results: Optional[Eval
         ams_overall = ams_results.aggregate_metrics.get("overall", {})
         amem_overall = amem_results.aggregate_metrics.get("overall", {})
         
+        print("\nMetric Deltas (AMS - A-MEM):")
+        for metric in KEY_METRICS:
+            ams_val = ams_overall.get(metric, {}).get("mean", 0)
+            amem_val = amem_overall.get(metric, {}).get("mean", 0)
+            delta = ams_val - amem_val
+            delta_pct = (delta / amem_val * 100) if amem_val > 0 else 0
+            winner = "✅" if delta > 0.001 else ("❌" if delta < -0.001 else "➖")
+            print(f"  {metric:20s}: {delta:+.4f} ({delta_pct:+.1f}%) {winner}")
+        
+        # Overall verdict based on F1
         ams_f1 = ams_overall.get("f1", {}).get("mean", 0)
         amem_f1 = amem_overall.get("f1", {}).get("mean", 0)
-        
-        delta = ams_f1 - amem_f1
-        delta_pct = (delta / amem_f1 * 100) if amem_f1 > 0 else 0
-        
-        print(f"\nOverall F1 Delta: {delta:+.4f} ({delta_pct:+.1f}%)")
-        
-        if delta > 0:
-            print("✅ AMS outperforms A-MEM")
-        elif delta < 0:
-            print("❌ A-MEM outperforms AMS")
+        if ams_f1 > amem_f1:
+            print("\n✅ Overall: AMS outperforms A-MEM")
+        elif ams_f1 < amem_f1:
+            print("\n❌ Overall: A-MEM outperforms AMS")
         else:
-            print("➖ Equal performance")
+            print("\n➖ Overall: Equal performance")
 
 
 def save_results(
