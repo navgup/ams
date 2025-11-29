@@ -362,7 +362,7 @@ class AMSAgent(dspy.Module):
             intent = self._map_category_to_intent(category)
         
         # =========================================
-        # Step 2: Retrieval Stage 1 (~50 candidates)
+        # Step 2: Retrieval Stage 1 and 2 (semantic search [ + optional filter] -> agent chooses most relevant artifacts)
         # =========================================
         artifacts, retrieval_metadata = self.retrieval_engine.retrieve(
             user_query=user_input,
@@ -598,7 +598,7 @@ class AMSAgent(dspy.Module):
 # ============================================================================
 
 def create_ams_agent(
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-5-mini",
     storage_path: Optional[str] = None,
     k_stage1: int = 50,
     k_stage2: int = 10,

@@ -559,6 +559,7 @@ def setup_logging(log_file: Optional[str] = None, verbose: bool = False) -> logg
 
 def select_questions(
     samples: List[LoCoMoSample],
+    n_samples: int = 1,
     n_questions: Optional[int] = None,
     ratio: Optional[float] = None,
     categories: Optional[List[int]] = None,
@@ -569,7 +570,8 @@ def select_questions(
     
     Args:
         samples: All LoCoMo samples
-        n_questions: Number of random questions to select
+        n_samples: Number of samples to use (limits which samples we draw from)
+        n_questions: Number of random questions to select (within selected samples)
         ratio: Ratio of questions to select (alternative to n_questions)
         categories: Filter to specific categories
         seed: Random seed for reproducibility
@@ -579,14 +581,18 @@ def select_questions(
     """
     random.seed(seed)
     
-    # Collect all questions with their sample indices
+    # Limit to first n_samples
+    n_samples = min(n_samples, len(samples))
+    
+    # Collect all questions from the selected samples
     all_questions = []
-    for sample_idx, sample in enumerate(samples):
+    for sample_idx in range(n_samples):
+        sample = samples[sample_idx]
         for qa in sample.qa:
             if categories is None or qa.category in categories:
                 all_questions.append((sample_idx, qa))
     
-    # Select subset
+    # Further filter by n_questions or ratio if specified
     if n_questions:
         n = min(n_questions, len(all_questions))
         return random.sample(all_questions, n)
@@ -692,28 +698,33 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run on 50 random questions
-  python test.py --n_questions 50
+  # Run on 1 sample (default) - all questions from first conversation
+  python test.py
   
-  # Compare AMS vs A-MEM on 100 questions
-  python test.py --n_questions 100 --compare_amem
+  # Run on 3 samples
+  python test.py --n_samples 3
   
-  # Run on specific categories (temporal + multi-hop)
-  python test.py --categories 2 3 --n_questions 30
+  # Run on 2 samples, only 10 random questions
+  python test.py --n_samples 2 --n_questions 10
   
-  # Run on 10% of the dataset
-  python test.py --ratio 0.1
+  # Compare AMS vs A-MEM on 1 sample
+  python test.py --n_samples 1 --compare_amem
+  
+  # Run on specific categories (temporal + multi-hop) from 2 samples
+  python test.py --n_samples 2 --categories 2 3
   
   # Use a different model
-  python test.py --model gpt-4 --backend openai --n_questions 20
+  python test.py --model gpt-4o-mini --backend openai --n_samples 1
         """
     )
     
     # Dataset options
     parser.add_argument("--dataset", type=str, default="../a-mem/data/locomo10.json",
                         help="Path to LoCoMo dataset")
+    parser.add_argument("--n_samples", type=int, default=1,
+                        help="Number of LoCoMo samples (conversations) to use (default: 1)")
     parser.add_argument("--n_questions", type=int, default=None,
-                        help="Number of random questions to evaluate")
+                        help="Number of random questions to evaluate (within selected samples)")
     parser.add_argument("--ratio", type=float, default=None,
                         help="Ratio of questions to evaluate (0.0 to 1.0)")
     parser.add_argument("--categories", type=int, nargs="+", default=None,
@@ -776,12 +787,13 @@ Examples:
     # Select questions
     questions = select_questions(
         samples,
+        n_samples=args.n_samples,
         n_questions=args.n_questions,
         ratio=args.ratio,
         categories=args.categories,
         seed=args.seed
     )
-    logger.info(f"Selected {len(questions)} questions for evaluation")
+    logger.info(f"Using {args.n_samples} sample(s), selected {len(questions)} questions for evaluation")
     
     if args.categories:
         logger.info(f"Filtering to categories: {args.categories}")

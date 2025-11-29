@@ -334,12 +334,7 @@ class FactArtifact(Artifact):
     
     def get_summary(self) -> str:
         """Return brief summary with status."""
-        status_emoji = {
-            ValidityStatus.VERIFIED: "✓",
-            ValidityStatus.CONFLICTING: "⚠",
-            ValidityStatus.DEPRECATED: "✗"
-        }
-        return f"[Fact {status_emoji[self.validity_status]}] {self.claim[:80]}..."
+        return f"[Fact {status[self.validity_status]}] {self.claim[:80]}..."
     
     def to_context_string(self) -> str:
         """Convert to LLM context string."""
