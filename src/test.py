@@ -61,6 +61,10 @@ def simple_tokenize(text: str) -> List[str]:
 
 def calculate_f1(prediction: str, reference: str) -> float:
     """Calculate token-level F1 score."""
+    # Ensure strings
+    prediction = str(prediction) if prediction else ""
+    reference = str(reference) if reference else ""
+    
     pred_tokens = set(simple_tokenize(prediction))
     ref_tokens = set(simple_tokenize(reference))
     
@@ -78,12 +82,19 @@ def calculate_f1(prediction: str, reference: str) -> float:
 
 def calculate_exact_match(prediction: str, reference: str) -> int:
     """Calculate exact match (case-insensitive)."""
+    # Ensure strings
+    prediction = str(prediction) if prediction else ""
+    reference = str(reference) if reference else ""
     return int(prediction.strip().lower() == reference.strip().lower())
 
 
 def calculate_metrics(prediction: str, reference: str) -> Dict[str, float]:
     """Calculate evaluation metrics."""
-    if not prediction or not reference:
+    # Convert None to empty string
+    prediction = str(prediction) if prediction else ""
+    reference = str(reference) if reference else ""
+    
+    if not prediction.strip() or not reference.strip():
         return {"exact_match": 0, "f1": 0.0}
     
     return {
@@ -137,6 +148,9 @@ class AMSEvaluator:
         k_stage1: int = 50,
         k_stage2: int = 10,
         ollama_url: str = "http://localhost:11434",
+        debug: bool = False,
+        max_turns_per_session: int = 0,  # 0 = no limit
+        max_content_chars: int = 0,  # 0 = no limit
     ):
         self.model = model
         self.backend = backend
@@ -144,6 +158,9 @@ class AMSEvaluator:
         self.k_stage1 = k_stage1
         self.k_stage2 = k_stage2
         self.ollama_url = ollama_url
+        self.debug = debug
+        self.max_turns_per_session = max_turns_per_session
+        self.max_content_chars = max_content_chars
         
         # Will be initialized per sample
         self.agent: Optional[AMSAgent] = None
@@ -185,10 +202,28 @@ class AMSEvaluator:
             return self.agent.store.get_stats()["total_artifacts"]
         
         total_extracted = 0
+        total_turns = 0
+        skipped_turns = 0
         
         for session_id, session in sample.conversation.sessions.items():
+            turn_count = 0
             for turn in session.turns:
+                # Debug mode: limit turns per session
+                if self.max_turns_per_session > 0 and turn_count >= self.max_turns_per_session:
+                    skipped_turns += 1
+                    continue
+                
                 try:
+                    # Skip turns with empty or None text
+                    content = turn.text or ""
+                    if not content.strip():
+                        skipped_turns += 1
+                        continue
+                    
+                    # Debug mode: truncate content
+                    if self.max_content_chars > 0:
+                        content = content[:self.max_content_chars]
+                    
                     # Parse timestamp
                     timestamp = None
                     if session.date_time:
@@ -202,13 +237,23 @@ class AMSEvaluator:
                     
                     _, extracted = self.agent.ingest_conversation(
                         speaker=turn.speaker,
-                        content=turn.text,
+                        content=content,
                         timestamp=timestamp,
                         session_id=str(session_id)
                     )
                     total_extracted += extracted
+                    total_turns += 1
+                    turn_count += 1
+                    
+                    if self.debug and total_turns % 10 == 0:
+                        logging.info(f"  [DEBUG] Ingested {total_turns} turns, {total_extracted} artifacts so far...")
+                        
                 except Exception as e:
                     logging.warning(f"Error ingesting turn: {e}")
+                    skipped_turns += 1
+        
+        if self.debug:
+            logging.info(f"  [DEBUG] Ingestion complete: {total_turns} turns, {skipped_turns} skipped, {total_extracted} artifacts")
         
         # Save to cache if path provided
         if cache_path:
@@ -294,11 +339,20 @@ class AMSEvaluator:
                 continue
             
             # Answer questions
-            for qa in tqdm(sample_qas, desc=f"Sample {sample_idx}", leave=False):
+            log.info(f"Sample {sample_idx}: Answering {len(sample_qas)} questions...")
+            for q_idx, qa in enumerate(tqdm(sample_qas, desc=f"Sample {sample_idx}", leave=False)):
+                if self.debug:
+                    log.info(f"  [DEBUG] Q{q_idx+1}/{len(sample_qas)}: {qa.question[:80]}...")
+                
                 prediction, thinking, retrieved, intent = self.answer_question(qa)
                 
                 reference = qa.final_answer or qa.answer or ""
                 metrics = calculate_metrics(prediction, reference)
+                
+                if self.debug:
+                    log.info(f"  [DEBUG] Answer: {str(prediction)[:100]}...")
+                    log.info(f"  [DEBUG] Reference: {str(reference)[:100]}...")
+                    log.info(f"  [DEBUG] F1={metrics['f1']:.3f}, EM={metrics['exact_match']}, Retrieved={retrieved}")
                 
                 result = QuestionResult(
                     sample_id=sample_idx,
@@ -704,8 +758,8 @@ Examples:
   # Run on 3 samples
   python test.py --n_samples 3
   
-  # Run on 2 samples, only 10 random questions
-  python test.py --n_samples 2 --n_questions 10
+  # QUICK SANITY CHECK: 1 sample, 5 turns/session, 100 chars/turn, 1 question
+  python test.py --debug --max_turns 5 --max_chars 100 --n_questions 1
   
   # Compare AMS vs A-MEM on 1 sample
   python test.py --n_samples 1 --compare_amem
@@ -761,6 +815,14 @@ Examples:
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose logging")
     
+    # Debug options (for quick sanity checks with minimal tokens)
+    parser.add_argument("--debug", action="store_true",
+                        help="Debug mode with extra logging and optional truncation")
+    parser.add_argument("--max_turns", type=int, default=0,
+                        help="Debug: max turns per session to ingest (0=unlimited)")
+    parser.add_argument("--max_chars", type=int, default=0,
+                        help="Debug: max chars per turn content (0=unlimited)")
+    
     args = parser.parse_args()
     
     # Setup
@@ -809,12 +871,23 @@ Examples:
     logger.info("Running AMS Evaluation")
     logger.info("=" * 50)
     
+    # Debug mode info
+    if args.debug:
+        logger.info("[DEBUG MODE ENABLED]")
+        if args.max_turns > 0:
+            logger.info(f"  Max turns per session: {args.max_turns}")
+        if args.max_chars > 0:
+            logger.info(f"  Max chars per turn: {args.max_chars}")
+    
     ams_evaluator = AMSEvaluator(
         model=args.model,
         backend=args.backend,
         k_stage1=args.k_stage1,
         k_stage2=args.k_stage2,
         ollama_url=args.ollama_url,
+        debug=args.debug,
+        max_turns_per_session=args.max_turns,
+        max_content_chars=args.max_chars,
     )
     
     ams_results = ams_evaluator.evaluate(
