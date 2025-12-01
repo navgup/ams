@@ -409,6 +409,23 @@ class HybridRetrievalEngine:
             if artifact:
                 candidates.append((artifact_id, artifact.get_summary(), score))
         
+        # FALLBACK: If no candidates from filtered search, try unfiltered semantic search
+        if not candidates:
+            metadata["fallback_triggered"] = True
+            fallback_results = self.store.semantic_search(
+                query=user_query,  # Use original query, not the optimized one
+                k=k_stage1
+            )
+            for artifact_id, score in fallback_results:
+                artifact = self.store.get_artifact(artifact_id)
+                if artifact:
+                    candidates.append((artifact_id, artifact.get_summary(), score))
+            
+            metadata["stages"].append({
+                "stage": "fallback",
+                "candidates": len(candidates)
+            })
+        
         if not candidates:
             return [], metadata
         
@@ -429,6 +446,17 @@ class HybridRetrievalEngine:
             artifact = self.store.get_artifact(aid)
             if artifact:
                 selected_artifacts.append(artifact)
+        
+        # FALLBACK: If context selector returned nothing but we had candidates,
+        # just take the top candidates by score
+        if not selected_artifacts and candidates:
+            metadata["selector_fallback"] = True
+            # Sort by score and take top k_stage2
+            sorted_candidates = sorted(candidates, key=lambda x: x[2], reverse=True)
+            for aid, _, _ in sorted_candidates[:k_stage2]:
+                artifact = self.store.get_artifact(aid)
+                if artifact:
+                    selected_artifacts.append(artifact)
         
         return selected_artifacts, metadata
     

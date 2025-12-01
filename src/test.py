@@ -39,10 +39,9 @@ import dspy
 from dateutil import parser as dateutil_parser
 from tqdm import tqdm
 
-# Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "a-mem"))
 
-from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation, LoCoMoSample
+from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation, LoCoMoSample, EventSummary, Observation
 
 # Import metrics from a-mem utils (comprehensive: ROUGE, BLEU, BERT, METEOR, SBERT)
 from utils import calculate_metrics, aggregate_metrics as amem_aggregate_metrics
@@ -51,6 +50,7 @@ from utils import calculate_metrics, aggregate_metrics as amem_aggregate_metrics
 from schemas import QueryIntent
 from storage import ArtifactStore
 from agent import AMSAgent, create_ams_agent, create_ollama_agent
+import nltk
 
 
 def parse_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -69,6 +69,87 @@ def parse_datetime(value: Optional[str]) -> Optional[datetime]:
     return dt.replace(tzinfo=None)
 
 
+def create_dummy_dataset() -> List[LoCoMoSample]:
+    """
+    Create a tiny synthetic dataset for end-to-end testing.
+    
+    This creates a minimal dataset with:
+    - 1 sample
+    - 1 session with 5 short turns (~200 tokens total)
+    - 2 simple QA questions
+    
+    Used with --dummy flag to verify the entire pipeline works
+    without burning tokens/time on the full LoCoMo dataset.
+    """
+    # Create 5 simple conversation turns
+    turns = [
+        Turn(speaker="Alice", dia_id="s1_t1", text="Hey Bob! I just got back from my trip to Paris."),
+        Turn(speaker="Bob", dia_id="s1_t2", text="That's awesome Alice! How was it?"),
+        Turn(speaker="Alice", dia_id="s1_t3", text="It was amazing. I visited the Eiffel Tower and ate so many croissants."),
+        Turn(speaker="Bob", dia_id="s1_t4", text="Nice! I'm planning to go to Tokyo next month."),
+        Turn(speaker="Alice", dia_id="s1_t5", text="Oh Tokyo is great! You should try the ramen there."),
+    ]
+    
+    # Create session
+    session = Session(
+        session_id=1,
+        date_time="2024-06-15T10:00:00Z",
+        turns=turns
+    )
+    
+    # Create conversation
+    conversation = Conversation(
+        speaker_a="Alice",
+        speaker_b="Bob",
+        sessions={1: session}
+    )
+    
+    # Create 2 simple QA questions
+    qa_list = [
+        QA(
+            question="Where did Alice travel to recently?",
+            answer="Paris",
+            evidence=["s1:s1_t1"],
+            category=1,  # Single-hop
+            adversarial_answer=None
+        ),
+        QA(
+            question="Where is Bob planning to go next month?",
+            answer="Tokyo",
+            evidence=["s1:s1_t4"],
+            category=1,  # Single-hop
+            adversarial_answer=None
+        ),
+    ]
+    
+    # Create minimal event summary and observation (required fields)
+    event_summary = EventSummary(events={
+        "session_1": {
+            "Alice": ["traveled to Paris", "visited Eiffel Tower"],
+            "Bob": ["planning Tokyo trip"]
+        }
+    })
+    
+    observation = Observation(observations={
+        "session_1": {
+            "Alice": [["loves travel", "s1_t1"]],
+            "Bob": [["interested in Japan", "s1_t4"]]
+        }
+    })
+    
+    # Create sample
+    sample = LoCoMoSample(
+        sample_id="dummy_0",
+        qa=qa_list,
+        conversation=conversation,
+        event_summary=event_summary,
+        observation=observation,
+        session_summary={"session_1": "Alice and Bob discussed travel plans."}
+    )
+    
+    return [sample]
+
+
 # ============================================================================
 # Result Storage
 # ============================================================================
@@ -85,6 +166,7 @@ class QuestionResult:
     metrics: Dict[str, float]
     retrieved_artifacts: int
     intent: str
+    artifact_summaries: List[str] = field(default_factory=list)
     
     
 @dataclass 
@@ -97,6 +179,7 @@ class EvaluationResults:
     category_counts: Dict[int, int]
     results: List[QuestionResult] = field(default_factory=list)
     aggregate_metrics: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 # ============================================================================
@@ -108,7 +191,7 @@ class AMSEvaluator:
     
     def __init__(
         self,
-        model: str = "gpt-5-mini",
+        model: str = "gpt-4o-mini",
         backend: str = "openai",
         storage_path: Optional[str] = None,
         k_stage1: int = 50,
@@ -220,12 +303,12 @@ class AMSEvaluator:
         
         return total_extracted
     
-    def answer_question(self, qa: QA) -> Tuple[str, str, int, str]:
+    def answer_question(self, qa: QA) -> Tuple[str, str, int, str, List[str]]:
         """
         Answer a question using the AMS agent.
         
         Returns:
-            Tuple of (prediction, thinking, retrieved_count, intent)
+            Tuple of (prediction, thinking, retrieved_count, intent, artifact_summaries)
         """
         try:
             response = self.agent(qa.question, category=qa.category)
@@ -233,11 +316,12 @@ class AMSEvaluator:
                 response.answer,
                 response.thinking,
                 response.retrieved_artifacts,
-                response.intent.value
+                response.intent.value,
+                response.artifact_summaries if hasattr(response, "artifact_summaries") else []
             )
         except Exception as e:
             logging.error(f"Error answering question: {e}")
-            return str(e), "", 0, "error"
+            return str(e), "", 0, "error", []
     
     def evaluate(
         self,
@@ -267,6 +351,8 @@ class AMSEvaluator:
             total_questions=0,
             category_counts=defaultdict(int),
         )
+        total_generated_artifacts = 0
+        total_artifacts_retrieved = 0
         
         # If specific questions provided, group by sample
         if questions:
@@ -292,6 +378,7 @@ class AMSEvaluator:
             try:
                 extracted = self.ingest_sample(sample, cache_path)
                 log.info(f"Sample {sample_idx}: ingested {extracted} artifacts")
+                total_generated_artifacts += extracted
             except Exception as e:
                 log.error(f"Error ingesting sample {sample_idx}: {e}")
                 continue
@@ -302,10 +389,16 @@ class AMSEvaluator:
                 if self.debug:
                     log.info(f"  [DEBUG] Q{q_idx+1}/{len(sample_qas)}: {qa.question[:80]}...")
                 
-                prediction, thinking, retrieved, intent = self.answer_question(qa)
+                prediction, thinking, retrieved, intent, artifact_summaries = self.answer_question(qa)
                 
-                reference = qa.final_answer or qa.answer or ""
+                # For category 5 (adversarial), the ground truth is "Not mentioned in the conversation"
+                # The adversarial_answer field is the TRAP answer, not the correct one!
+                if qa.category == 5:
+                    reference = "Not mentioned in the conversation"
+                else:
+                    reference = qa.final_answer or qa.answer or ""
                 metrics = calculate_metrics(prediction, reference)
+                total_artifacts_retrieved += retrieved
                 
                 if self.debug:
                     log.info(f"  [DEBUG] Answer: {str(prediction)[:100]}...")
@@ -324,6 +417,7 @@ class AMSEvaluator:
                     metrics=metrics,
                     retrieved_artifacts=retrieved,
                     intent=intent,
+                    artifact_summaries=artifact_summaries,
                 )
                 
                 results.results.append(result)
@@ -334,6 +428,12 @@ class AMSEvaluator:
         
         # Calculate aggregate metrics
         results.aggregate_metrics = self._aggregate_metrics(results.results)
+        if results.total_questions > 0:
+            results.metadata["artifact_stats"] = {
+                "total_generated": total_generated_artifacts,
+                "total_retrieved": total_artifacts_retrieved,
+                "avg_retrieved_per_question": total_artifacts_retrieved / results.total_questions if results.total_questions else 0,
+            }
         
         return results
     
@@ -358,7 +458,7 @@ class AMEMEvaluator:
     
     def __init__(
         self,
-        model: str = "gpt-5-mini",
+        model: str = "gpt-4o-mini",
         backend: str = "openai",
         retrieve_k: int = 10,
         temperature_c5: float = 0.5,
@@ -401,6 +501,8 @@ class AMEMEvaluator:
             total_questions=0,
             category_counts=defaultdict(int),
         )
+        total_generated_memories = 0
+        total_context_retrieved = 0
         
         # Group questions by sample
         if questions:
@@ -442,17 +544,31 @@ class AMEMEvaluator:
                     with open(cache_path, 'wb') as f:
                         pickle.dump(memory_system.memories, f)
             
+            # Track generated memories (notes)
+            try:
+                total_generated_memories += len(memory_system.memories)
+            except Exception:
+                pass
+            
             # Answer questions
             for qa in tqdm(sample_qas, desc=f"A-MEM {sample_idx}", leave=False):
                 try:
-                    prediction = self._answer_amem(memory_system, qa)
+                    prediction, context = self._answer_amem(memory_system, qa)
                 except Exception as e:
                     log.warning(f"A-MEM error: {e}")
                     prediction = str(e)
+                    context = []
                 
-                reference = qa.final_answer or qa.answer or ""
+                # For category 5 (adversarial), the ground truth is "Not mentioned in the conversation"
+                # The adversarial_answer field is the TRAP answer, not the correct one!
+                if qa.category == 5:
+                    reference = "Not mentioned in the conversation"
+                else:
+                    reference = qa.final_answer or qa.answer or ""
                 metrics = calculate_metrics(prediction, reference)
                 
+                context_count = len(context) if isinstance(context, list) else 0
+                total_context_retrieved += context_count
                 result = QuestionResult(
                     sample_id=sample_idx,
                     question=qa.question,
@@ -461,8 +577,9 @@ class AMEMEvaluator:
                     prediction=prediction,
                     thinking="",  # A-MEM doesn't capture thinking
                     metrics=metrics,
-                    retrieved_artifacts=0,
+                    retrieved_artifacts=context_count,
                     intent="unknown",
+                    artifact_summaries=context if isinstance(context, list) else [],
                 )
                 
                 results.results.append(result)
@@ -471,18 +588,25 @@ class AMEMEvaluator:
         
         # Aggregate
         results.aggregate_metrics = self._aggregate_metrics(results.results)
+        if results.total_questions > 0:
+            results.metadata["artifact_stats"] = {
+                "total_generated": total_generated_memories,
+                "total_retrieved": total_context_retrieved,
+                "avg_retrieved_per_question": total_context_retrieved / results.total_questions if results.total_questions else 0,
+            }
         
         return results
     
-    def _answer_amem(self, memory_system, qa: QA) -> str:
-        """Answer using A-MEM."""
+    def _answer_amem(self, memory_system, qa: QA) -> Tuple[str, List[str]]:
+        """Answer using A-MEM. Returns tuple of (answer, retrieved_context)."""
         # Retrieve context
         context = memory_system.find_related_memories_raw(qa.question, k=self.retrieve_k)
         
         # Generate answer (simplified - using the memory system's LLM)
         prompt = f"""Based on the context: {context}
         
-        Answer the following question briefly.
+        Answer the following question. Return ONLY the direct answer - concise, no explanations. If unanswerable, ONLY return 'Not mentioned in the conversation'.
+        
         Question: {qa.question}
         
         Answer:"""
@@ -502,9 +626,9 @@ class AMEMEvaluator:
         )
         
         try:
-            return json.loads(response)["answer"]
+            return json.loads(response)["answer"], context
         except:
-            return response
+            return response, context
     
     def _aggregate_metrics(self, results: List[QuestionResult]) -> Dict[str, Dict[str, float]]:
         """Aggregate metrics using a-mem's aggregate_metrics."""
@@ -588,6 +712,18 @@ def select_questions(
         return all_questions
 
 
+def compute_metrics_excluding_adversarial(results: EvaluationResults) -> Dict[str, Dict[str, float]]:
+    """Compute aggregate metrics excluding category 5 (adversarial) questions."""
+    non_adversarial = [r for r in results.results if r.category != 5]
+    if not non_adversarial:
+        return {}
+    
+    all_metrics = [r.metrics for r in non_adversarial]
+    all_categories = [r.category for r in non_adversarial]
+    
+    return amem_aggregate_metrics(all_metrics, all_categories)
+
+
 def print_comparison(ams_results: EvaluationResults, amem_results: Optional[EvaluationResults]):
     """Print comparison between AMS and A-MEM results."""
     print("\n" + "=" * 70)
@@ -602,27 +738,51 @@ def print_comparison(ams_results: EvaluationResults, amem_results: Optional[Eval
         print("-" * 60)
         print(f"Total questions: {results.total_questions}")
         
+        artifact_stats = results.metadata.get("artifact_stats") if results.metadata else None
+        if artifact_stats:
+            print("Artifact / Memory Stats:")
+            print(f"  Total generated: {artifact_stats.get('total_generated', 0)}")
+            print(f"  Total retrieved/context items: {artifact_stats.get('total_retrieved', 0)}")
+            print(f"  Avg retrieved per question: {artifact_stats.get('avg_retrieved_per_question', 0):.2f}")
+        
+        # Count adversarial questions
+        n_adversarial = results.category_counts.get(5, 0)
+        n_non_adversarial = results.total_questions - n_adversarial
+        
         if results.aggregate_metrics:
             overall = results.aggregate_metrics.get("overall", {})
             
-            # Print all key metrics
-            print("\nOverall Metrics:")
+            # Print all key metrics (including adversarial)
+            print(f"\nOverall Metrics (ALL {results.total_questions} questions):")
             for metric in KEY_METRICS:
                 if metric in overall:
                     val = overall[metric].get("mean", 0)
                     print(f"  {metric:20s}: {val:.4f}")
             
-            # Print by category (condensed)
-            print("\nBy Category (F1 / BERT-F1 / SBERT):")
+            # Compute and print metrics EXCLUDING adversarial
+            if n_adversarial > 0 and n_non_adversarial > 0:
+                non_adv_metrics = compute_metrics_excluding_adversarial(results)
+                if non_adv_metrics:
+                    non_adv_overall = non_adv_metrics.get("overall", {})
+                    print(f"\nOverall Metrics (EXCLUDING {n_adversarial} adversarial, n={n_non_adversarial}):")
+                    for metric in KEY_METRICS:
+                        if metric in non_adv_overall:
+                            val = non_adv_overall[metric].get("mean", 0)
+                            print(f"  {metric:20s}: {val:.4f}")
+            
+            # Print by category (with F1 and BLEU-1 first)
+            print("\nBy Category (F1 / BLEU-1 / BERT-F1 / SBERT):")
             for cat in sorted(results.category_counts.keys()):
                 cat_key = f"category_{cat}"
                 if cat_key in results.aggregate_metrics:
                     cat_metrics = results.aggregate_metrics[cat_key]
                     cat_f1 = cat_metrics.get("f1", {}).get("mean", 0)
+                    cat_bleu1 = cat_metrics.get("bleu1", {}).get("mean", 0)
                     cat_bert = cat_metrics.get("bert_f1", {}).get("mean", 0)
                     cat_sbert = cat_metrics.get("sbert_similarity", {}).get("mean", 0)
                     count = results.category_counts[cat]
-                    print(f"  Cat {cat}: {cat_f1:.3f} / {cat_bert:.3f} / {cat_sbert:.3f} (n={count})")
+                    cat_label = f"Cat {cat}" if cat != 5 else "Cat 5 (adv)"
+                    print(f"  {cat_label}: {cat_f1:.3f} / {cat_bleu1:.3f} / {cat_bert:.3f} / {cat_sbert:.3f} (n={count})")
     
     print_system_results(ams_results, "AMS (Agent Memory Scaffolding)")
     
@@ -637,7 +797,7 @@ def print_comparison(ams_results: EvaluationResults, amem_results: Optional[Eval
         ams_overall = ams_results.aggregate_metrics.get("overall", {})
         amem_overall = amem_results.aggregate_metrics.get("overall", {})
         
-        print("\nMetric Deltas (AMS - A-MEM):")
+        print("\nMetric Deltas - ALL questions (AMS - A-MEM):")
         for metric in KEY_METRICS:
             ams_val = ams_overall.get(metric, {}).get("mean", 0)
             amem_val = amem_overall.get(metric, {}).get("mean", 0)
@@ -645,6 +805,26 @@ def print_comparison(ams_results: EvaluationResults, amem_results: Optional[Eval
             delta_pct = (delta / amem_val * 100) if amem_val > 0 else 0
             winner = "✅" if delta > 0.001 else ("❌" if delta < -0.001 else "➖")
             print(f"  {metric:20s}: {delta:+.4f} ({delta_pct:+.1f}%) {winner}")
+        
+        # Also show comparison EXCLUDING adversarial
+        n_adv_ams = ams_results.category_counts.get(5, 0)
+        n_adv_amem = amem_results.category_counts.get(5, 0)
+        if n_adv_ams > 0 or n_adv_amem > 0:
+            ams_non_adv = compute_metrics_excluding_adversarial(ams_results)
+            amem_non_adv = compute_metrics_excluding_adversarial(amem_results)
+            
+            if ams_non_adv and amem_non_adv:
+                ams_na_overall = ams_non_adv.get("overall", {})
+                amem_na_overall = amem_non_adv.get("overall", {})
+                
+                print("\nMetric Deltas - EXCLUDING adversarial (AMS - A-MEM):")
+                for metric in KEY_METRICS:
+                    ams_val = ams_na_overall.get(metric, {}).get("mean", 0)
+                    amem_val = amem_na_overall.get(metric, {}).get("mean", 0)
+                    delta = ams_val - amem_val
+                    delta_pct = (delta / amem_val * 100) if amem_val > 0 else 0
+                    winner = "✅" if delta > 0.001 else ("❌" if delta < -0.001 else "➖")
+                    print(f"  {metric:20s}: {delta:+.4f} ({delta_pct:+.1f}%) {winner}")
         
         # Overall verdict based on F1
         ams_f1 = ams_overall.get("f1", {}).get("mean", 0)
@@ -691,19 +871,24 @@ def save_results(
 
 
 def main():
+    nltk.download('punkt_tab')
+
     parser = argparse.ArgumentParser(
         description="Evaluate AMS on LoCoMo benchmark",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # END-TO-END TEST (recommended first!): Tiny synthetic data, ~5 min total
+  python test.py --dummy
+  
+  # E2E test with A-MEM comparison
+  python test.py --dummy --compare_amem
+  
   # Run on 1 sample (default) - all questions from first conversation
   python test.py
   
   # Run on 3 samples
   python test.py --n_samples 3
-  
-  # QUICK SANITY CHECK: 1 sample, 5 turns/session, 100 chars/turn, 1 question
-  python test.py --debug --max_turns 5 --max_chars 100 --n_questions 1
   
   # Compare AMS vs A-MEM on 1 sample
   python test.py --n_samples 1 --compare_amem
@@ -731,7 +916,7 @@ Examples:
                         help="Random seed for question selection")
     
     # Model options
-    parser.add_argument("--model", type=str, default="gpt-5-mini",
+    parser.add_argument("--model", type=str, default="gpt-4o-mini",
                         help="Model to use")
     parser.add_argument("--backend", type=str, default="openai",
                         choices=["openai", "ollama"],
@@ -767,39 +952,55 @@ Examples:
     parser.add_argument("--max_chars", type=int, default=0,
                         help="Debug: max chars per turn content (0=unlimited)")
     
+    # Dummy mode for end-to-end testing without burning tokens/time
+    parser.add_argument("--dummy", action="store_true",
+                        help="Use tiny synthetic dataset for end-to-end testing (5 turns, 2 QAs, ~5 min total)")
+    
     args = parser.parse_args()
     
     # Setup
     logger = setup_logging(args.log_file, args.verbose)
     
-    # Resolve paths
-    dataset_path = Path(__file__).parent / args.dataset
-    if not dataset_path.exists():
-        # Try absolute path
-        dataset_path = Path(args.dataset)
-    
-    if not dataset_path.exists():
-        logger.error(f"Dataset not found: {dataset_path}")
-        sys.exit(1)
+    # Resolve paths (skip dataset check if using dummy mode)
+    dataset_path = None
+    if not args.dummy:
+        dataset_path = Path(__file__).parent / args.dataset
+        if not dataset_path.exists():
+            # Try absolute path
+            dataset_path = Path(args.dataset)
+        
+        if not dataset_path.exists():
+            logger.error(f"Dataset not found: {dataset_path}")
+            sys.exit(1)
     
     cache_dir = Path(args.cache_dir) if args.cache_dir else None
     output_path = Path(args.output) if args.output else None
     
-    # Load dataset
-    logger.info(f"Loading dataset from {dataset_path}")
-    samples = load_locomo_dataset(str(dataset_path))
-    logger.info(f"Loaded {len(samples)} samples")
-    
-    # Select questions
-    questions = select_questions(
-        samples,
-        n_samples=args.n_samples,
-        n_questions=args.n_questions,
-        ratio=args.ratio,
-        categories=args.categories,
-        seed=args.seed
-    )
-    logger.info(f"Using {args.n_samples} sample(s), selected {len(questions)} questions for evaluation")
+    # Load dataset (or use dummy for end-to-end testing)
+    if args.dummy:
+        logger.info("=" * 50)
+        logger.info("DUMMY MODE: Using tiny synthetic dataset for E2E testing")
+        logger.info("=" * 50)
+        samples = create_dummy_dataset()
+        logger.info(f"Created dummy dataset: 1 sample, 5 turns, 2 QA questions")
+        # In dummy mode, use all questions from the dummy sample
+        questions = [(0, qa) for qa in samples[0].qa]
+        logger.info(f"Using all {len(questions)} dummy questions")
+    else:
+        logger.info(f"Loading dataset from {dataset_path}")
+        samples = load_locomo_dataset(str(dataset_path))
+        logger.info(f"Loaded {len(samples)} samples")
+        
+        # Select questions
+        questions = select_questions(
+            samples,
+            n_samples=args.n_samples,
+            n_questions=args.n_questions,
+            ratio=args.ratio,
+            categories=args.categories,
+            seed=args.seed
+        )
+        logger.info(f"Using {args.n_samples} sample(s), selected {len(questions)} questions for evaluation")
     
     if args.categories:
         logger.info(f"Filtering to categories: {args.categories}")

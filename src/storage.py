@@ -8,7 +8,7 @@ Provides in-memory and persistent storage for artifacts with:
 """
 
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple, Union
 from uuid import uuid4
 import json
@@ -17,6 +17,20 @@ from pathlib import Path
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+
+
+def _normalize_datetime(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    Normalize datetime to naive UTC for consistent comparison.
+    
+    This fixes "can't compare offset-naive and offset-aware datetimes" errors.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        # Convert to UTC then strip timezone
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 from schemas import (
     Artifact,
@@ -326,11 +340,20 @@ class ArtifactStore:
             
             # Temporal filter
             if filters.temporal_filter:
-                if not hasattr(artifact, 'timestamp'):
+                if not hasattr(artifact, 'timestamp') or artifact.timestamp is None:
                     continue
                 
-                artifact_time = artifact.timestamp
-                filter_time = datetime.fromisoformat(filters.temporal_filter.value)
+                # Normalize both datetimes to naive UTC for consistent comparison
+                artifact_time = _normalize_datetime(artifact.timestamp)
+                try:
+                    filter_time = _normalize_datetime(datetime.fromisoformat(filters.temporal_filter.value))
+                except (ValueError, TypeError):
+                    # Skip this filter if we can't parse the value
+                    continue
+                
+                if artifact_time is None or filter_time is None:
+                    continue
+                
                 op = filters.temporal_filter.operator
                 
                 if op == "$gt" and not artifact_time > filter_time:

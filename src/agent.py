@@ -60,7 +60,7 @@ class AnswerWithReasoningSignature(dspy.Signature):
         desc="Step-by-step reasoning process - be explicit about your logic chain"
     )
     answer: str = dspy.OutputField(
-        desc="The final concise answer to the question"
+        desc="ONLY the direct answer - extremely concise, no explanations. For names give just the name. For dates use natural format like '7 May 2023'. Match the expected answer format."
     )
 
 
@@ -90,7 +90,7 @@ class MultiHopAnswerSignature(dspy.Signature):
         desc="Key intermediate facts discovered during reasoning"
     )
     answer: str = dspy.OutputField(
-        desc="The final answer to the multi-hop question"
+        desc="ONLY the final answer - just the name, place, date, or fact. No sentences or explanations."
     )
 
 
@@ -116,7 +116,7 @@ class TemporalAnswerSignature(dspy.Signature):
         desc="Analysis of the temporal aspects and timeline"
     )
     answer: str = dspy.OutputField(
-        desc="The answer with appropriate temporal context"
+        desc="ONLY the date/time answer in natural format like '7 May 2023' or '2022'. No full sentences, just the temporal answer."
     )
 
 
@@ -143,7 +143,7 @@ class AdversarialAnswerSignature(dspy.Signature):
         desc="'yes' if the question can be answered from context, 'no' if not mentioned"
     )
     answer: str = dspy.OutputField(
-        desc="The answer, or 'Not mentioned in the conversation' if unanswerable"
+        desc="ONLY the direct answer - concise, no explanations. If unanswerable, say ONLY 'Not mentioned in the conversation'"
     )
 
 
@@ -273,6 +273,7 @@ class AMSAgentResponse(BaseModel):
     intent: QueryIntent = Field(default=QueryIntent.FACTUAL, description="Detected query intent")
     retrieved_artifacts: int = Field(default=0, description="Number of artifacts retrieved")
     reasoning_applied: bool = Field(default=False, description="Whether a stored strategy was applied")
+    artifact_summaries: List[str] = Field(default_factory=list, description="Summaries of retrieved artifacts used for answering")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
 
 
@@ -373,6 +374,7 @@ class AMSAgent(dspy.Module):
         
         # Build context from retrieved artifacts
         context = self._build_context(artifacts)
+        artifact_summaries = [artifact.get_summary() for artifact in artifacts]
         
         # =========================================
         # Step 3: Retrieve reasoning strategies
@@ -417,10 +419,12 @@ class AMSAgent(dspy.Module):
             intent=intent,
             retrieved_artifacts=len(artifacts),
             reasoning_applied=reasoning_applied,
+            artifact_summaries=artifact_summaries,
             metadata={
                 "filters": filters.model_dump() if filters else {},
                 "semantic_query": semantic_query,
                 "retrieval": retrieval_metadata,
+                "artifact_summaries": artifact_summaries,
             }
         )
     
@@ -602,8 +606,8 @@ def create_ams_agent(
     storage_path: Optional[str] = None,
     k_stage1: int = 50,
     k_stage2: int = 10,
-    temperature: float = 1.0, #1 for reasoning models 
-    max_tokens: int = 16000, #>= 16000 for reasoning
+    temperature: float = 0.7, #1 for reasoning models 
+    max_tokens: int = 1000, #>= 16000 for reasoning
 ) -> AMSAgent:
     """
     Create and configure an AMS agent.

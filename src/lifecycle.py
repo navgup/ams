@@ -12,11 +12,25 @@ the intermediate work that would otherwise be lost.
 
 from __future__ import annotations
 from typing import List, Optional, Dict, Any, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import re
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+
+
+def _normalize_datetime(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    Normalize datetime to naive UTC for consistent comparison.
+    
+    This fixes "can't compare offset-naive and offset-aware datetimes" errors.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        # Convert to UTC then strip timezone
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 import dspy
 from pydantic import BaseModel, Field
@@ -321,6 +335,9 @@ class EventExtractor(dspy.Module):
                         continue
                 else:
                     timestamp = ref_date  # Fallback to reference date
+            
+            # Normalize to naive UTC for consistent comparison
+            timestamp = _normalize_datetime(timestamp)
             
             artifacts.append(EventArtifact(
                 description=description,
