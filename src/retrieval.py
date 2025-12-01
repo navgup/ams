@@ -402,7 +402,31 @@ class HybridRetrievalEngine:
             )
             metadata["hops"] = hop_metadata
         
-        # Stage 2: Context selection
+        # Decide whether to run the expensive ContextSelector
+        use_fast_path = intent == QueryIntent.FACTUAL or len(search_results) <= k_stage2
+        
+        if use_fast_path:
+            metadata["retrieval_path"] = "fast"
+            selected_artifacts = []
+            selected_ids = []
+            for artifact_id, _ in search_results[:k_stage2]:
+                artifact = self.store.get_artifact(artifact_id)
+                if artifact:
+                    selected_artifacts.append(artifact)
+                    selected_ids.append(artifact_id)
+            
+            metadata["stages"].append({
+                "stage": 2,
+                "path": "fast",
+                "selected": len(selected_ids),
+                "reasoning": "Skipped ContextSelector for simple/factual query"
+            })
+            
+            return selected_artifacts, metadata
+        
+        metadata["retrieval_path"] = "slow"
+        
+        # Stage 2: Context selection (LLM reasoning path)
         candidates = []
         for artifact_id, score in search_results:
             artifact = self.store.get_artifact(artifact_id)
