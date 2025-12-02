@@ -37,7 +37,6 @@ from pydantic import BaseModel, Field
 
 from schemas import (
     Artifact,
-    EntityArtifact,
     EventArtifact,
     FactArtifact,
     ReasoningArtifact,
@@ -87,17 +86,6 @@ class ReasoningExtractorSignature(dspy.Signature):
     )
     outcome_rating: str = dspy.OutputField(
         desc="Rating 1-5 based on how well the strategy worked"
-    )
-
-
-class EntityExtractorSignature(dspy.Signature):
-    """Extract entities mentioned in text."""
-    
-    text: str = dspy.InputField(desc="Text to extract entities from")
-    context: str = dspy.InputField(desc="Conversation context for disambiguation")
-    
-    entities: str = dspy.OutputField(
-        desc="JSON list of entities: [{name, type, summary, aliases}]"
     )
 
 
@@ -225,57 +213,6 @@ class ReasoningExtractor(dspy.Module):
             original_query=user_query,
             example_execution=raw_model_trace[:500]  # Store truncated example
         )
-
-
-class EntityExtractor(dspy.Module):
-    """Extracts entity artifacts from text."""
-    
-    def __init__(self):
-        super().__init__()
-        self.extractor = dspy.ChainOfThought(EntityExtractorSignature)
-    
-    def forward(
-        self,
-        text: str,
-        context: str = ""
-    ) -> List[EntityArtifact]:
-        """
-        Extract entities from text.
-        
-        Args:
-            text: Text to extract from
-            context: Additional context
-            
-        Returns:
-            List of EntityArtifacts
-        """
-        result = self.extractor(
-            text=text,
-            context=context or "No additional context"
-        )
-        
-        try:
-            entities_data = json.loads(result.entities)
-        except json.JSONDecodeError:
-            return []
-        
-        artifacts = []
-        for entity in entities_data:
-            if not isinstance(entity, dict):
-                continue
-            
-            name = entity.get("name", "").strip()
-            if not name:
-                continue
-            
-            artifacts.append(EntityArtifact(
-                name=name,
-                summary=entity.get("summary", f"Entity: {name}"),
-                aliases=entity.get("aliases", []),
-                entity_type=entity.get("type"),
-            ))
-        
-        return artifacts
 
 
 class EventExtractor(dspy.Module):
@@ -639,7 +576,6 @@ class LifecycleManager:
         
         # Extractors
         self.reasoning_extractor = ReasoningExtractor()
-        self.entity_extractor = EntityExtractor()
         self.event_extractor = EventExtractor()
         self.fact_extractor = FactExtractor()
         self.fact_consolidator = FactConsolidator(store)
@@ -713,17 +649,6 @@ class LifecycleManager:
         saved_turn = self.store.save_artifact(turn)
         
         extracted = []
-        
-        # Extract entities
-        entities = self.entity_extractor(
-            text=content,
-            context=f"Speaker: {speaker}"
-        )
-        for entity in entities:
-            entity.provenance_id = saved_turn.id
-            saved = self.store.save_artifact(entity)
-            extracted.append(saved)
-            turn.extracted_artifact_ids.append(saved.id)
         
         # Extract events
         events = self.event_extractor(

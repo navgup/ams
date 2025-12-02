@@ -52,7 +52,7 @@ class QueryRouterSignature(dspy.Signature):
     
     # Structured outputs
     artifact_type: str = dspy.OutputField(
-        desc="Most relevant artifact type: EntityArtifact, EventArtifact, FactArtifact, ReasoningArtifact, or 'any'"
+        desc="Most relevant artifact type: EventArtifact, FactArtifact, ReasoningArtifact, or 'any'"
     )
     temporal_operator: str = dspy.OutputField(
         desc="Temporal operator if query involves time: $gt, $lt, $gte, $lte, $eq, or 'none'"
@@ -65,9 +65,6 @@ class QueryRouterSignature(dspy.Signature):
     )
     intent: str = dspy.OutputField(
         desc="Query intent: factual, temporal, reasoning, or multi_hop"
-    )
-    entity_filter: str = dspy.OutputField(
-        desc="Entity name to filter by, or 'none'"
     )
     topic_tags: str = dspy.OutputField(
         desc="Comma-separated topic tags to filter by, or 'none'"
@@ -191,17 +188,11 @@ class QueryRouter(dspy.Module):
         if result.topic_tags and result.topic_tags.lower() != "none":
             topic_tags = [t.strip() for t in result.topic_tags.split(",") if t.strip()]
         
-        # Parse entity filter
-        entity_filter = None
-        if result.entity_filter and result.entity_filter.lower() != "none":
-            entity_filter = result.entity_filter
-        
         # Build structured filter
         filters = StructuredFilter(
             artifact_type=artifact_type,
             temporal_filter=temporal_filter,
             topic_tags=topic_tags,
-            entity_name=entity_filter,
         )
         
         # Parse intent

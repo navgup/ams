@@ -22,7 +22,6 @@ Components:
 
 from .schemas import (
     Artifact,
-    EntityArtifact,
     EventArtifact,
     FactArtifact,
     ReasoningArtifact,
@@ -45,7 +44,6 @@ from .retrieval import (
 
 from .lifecycle import (
     ReasoningExtractor,
-    EntityExtractor,
     EventExtractor,
     FactExtractor,
     FactConsolidator,
@@ -63,7 +61,6 @@ __version__ = "0.1.0"
 __all__ = [
     # Schemas
     "Artifact",
-    "EntityArtifact",
     "EventArtifact",
     "FactArtifact",
     "ReasoningArtifact",
@@ -82,7 +79,6 @@ __all__ = [
     "create_retrieval_engine",
     # Lifecycle
     "ReasoningExtractor",
-    "EntityExtractor",
     "EventExtractor",
     "FactExtractor",
     "FactConsolidator",

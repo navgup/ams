@@ -34,7 +34,6 @@ def _normalize_datetime(dt: Optional[datetime]) -> Optional[datetime]:
 
 from schemas import (
     Artifact,
-    EntityArtifact,
     EventArtifact,
     FactArtifact,
     ReasoningArtifact,
@@ -88,41 +87,10 @@ class ArtifactStore:
         # Embedding matrix for semantic search
         self.embeddings: Optional[np.ndarray] = None
         self.embedding_ids: List[str] = []  # Maps embedding index to artifact id
-        
-        # Entity name index for deduplication
-        self.entity_name_index: Dict[str, str] = {}  # normalized_name -> artifact_id
-        
+    
     def _generate_embedding(self, text: str) -> np.ndarray:
         """Generate embedding for text."""
         return self.embedding_model.encode([text])[0]
-    
-    def _normalize_name(self, name: str) -> str:
-        """Normalize entity name for deduplication."""
-        return name.lower().strip()
-    
-    def _find_existing_entity(self, entity: EntityArtifact) -> Optional[str]:
-        """
-        Find an existing entity that matches this one.
-        
-        Checks:
-        1. Exact name match
-        2. Alias match
-        
-        Returns:
-            ID of existing entity if found, None otherwise
-        """
-        # Check primary name
-        normalized = self._normalize_name(entity.name)
-        if normalized in self.entity_name_index:
-            return self.entity_name_index[normalized]
-        
-        # Check aliases
-        for alias in entity.aliases:
-            normalized_alias = self._normalize_name(alias)
-            if normalized_alias in self.entity_name_index:
-                return self.entity_name_index[normalized_alias]
-        
-        return None
     
     def save_artifact(self, artifact: Artifact, update_of: Optional[str] = None) -> Artifact:
         """
@@ -141,12 +109,6 @@ class ArtifactStore:
         Returns:
             The saved artifact with updated fields
         """
-        # Handle entity deduplication
-        if isinstance(artifact, EntityArtifact):
-            existing_id = self._find_existing_entity(artifact)
-            if existing_id and not update_of:
-                update_of = existing_id
-        
         # Generate new ID for this version
         new_id = str(uuid4())
         artifact.id = new_id
@@ -190,12 +152,6 @@ class ArtifactStore:
         artifact_type = artifact.__class__.__name__
         if artifact_type in self.type_index:
             self.type_index[artifact_type].append(new_id)
-        
-        # Update entity name index
-        if isinstance(artifact, EntityArtifact):
-            self.entity_name_index[self._normalize_name(artifact.name)] = new_id
-            for alias in artifact.aliases:
-                self.entity_name_index[self._normalize_name(alias)] = new_id
         
         # Update embedding matrix
         self._update_embeddings(new_id, embedding)
@@ -486,7 +442,6 @@ class ArtifactStore:
         indices = {
             'type_index': self.type_index,
             'version_chains': self.version_chains,
-            'entity_name_index': self.entity_name_index,
             'embedding_ids': self.embedding_ids,
         }
         with open(save_path / "indices.pkl", "wb") as f:
@@ -528,7 +483,6 @@ class ArtifactStore:
         
         self.type_index = indices['type_index']
         self.version_chains = indices['version_chains']
-        self.entity_name_index = indices['entity_name_index']
         self.embedding_ids = indices['embedding_ids']
         
         # Load embeddings
@@ -546,6 +500,5 @@ class ArtifactStore:
             "current_artifacts": current_count,
             "type_counts": type_counts,
             "version_chains": len(self.version_chains),
-            "entities_indexed": len(self.entity_name_index),
         }
 

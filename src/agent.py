@@ -21,7 +21,6 @@ from pydantic import BaseModel, Field
 
 from schemas import (
     Artifact,
-    EntityArtifact,
     EventArtifact,
     FactArtifact,
     ReasoningArtifact,
