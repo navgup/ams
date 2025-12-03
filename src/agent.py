@@ -115,7 +115,7 @@ class TemporalAnswerSignature(dspy.Signature):
         desc="Analysis of the temporal aspects and timeline"
     )
     answer: str = dspy.OutputField(
-        desc="ONLY the date/time answer in natural format like '7 May 2023' or '2022'. No full sentences, just the temporal answer."
+        desc="ONLY the date/time answer in a natural format like '7 May 2023', '2022', or 'The Thursday before 7 May 2023' [the format of your answer should be the same format as the contextual evidence]. No full sentences, just the temporal answer."
     )
 
 

@@ -581,7 +581,7 @@ class LifecycleManager:
         self.fact_consolidator = FactConsolidator(store)
         
         # Background executor for async operations
-        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.executor = ThreadPoolExecutor(max_workers=20)
     
     def process_thinking_trace(
         self,

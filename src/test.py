@@ -27,17 +27,26 @@ import argparse
 import logging
 import pickle
 import random
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ast
 
 import dspy
 from dateutil import parser as dateutil_parser
 from tqdm import tqdm
+from openai import OpenAI
+
+# Suppress transformers warnings about uninitialized pooler weights
+# (harmless when using models for feature extraction like BERT-score)
+warnings.filterwarnings("ignore", message="Some weights of.*were not initialized")
+warnings.filterwarnings("ignore", message=".*pooler.*were not initialized")
+warnings.filterwarnings("ignore", message="Some weights of RobertaModel were not initialized from the model checkpoint at roberta-large and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight'] You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference")
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "a-mem"))
 
@@ -181,6 +190,110 @@ class EvaluationResults:
     results: List[QuestionResult] = field(default_factory=list)
     aggregate_metrics: Dict[str, Dict[str, float]] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class LLMJudge:
+    """
+    LLM-as-a-judge using Together AI (OpenAI-compatible API).
+    
+    Adds a semantic correctness score (0.0-1.0) as an extra metric: 'llm_judge'.
+    """
+    
+    def __init__(
+        self,
+        model: str,
+        max_workers: int = 20,
+        timeout: float = 15.0,
+        base_url: str = "https://api.together.xyz/v1",
+    ):
+        self.model = model
+        self.max_workers = max_workers
+        self.timeout = timeout
+        
+        api_key = os.getenv("TOGETHER_API_KEY")
+        if not api_key:
+            logging.warning("TOGETHER_API_KEY not set; LLM judge will be disabled.")
+            self.client: Optional[OpenAI] = None
+        else:
+            # Use OpenAI client pointed at Together's API
+            self.client = OpenAI(api_key=api_key, base_url=base_url)
+    
+    def _score_single(self, question: str, reference: str, prediction: str) -> Optional[float]:
+        """Score a single QA pair, returning a float in [0.0, 1.0]."""
+        if not self.client:
+            return None
+        
+        system_prompt = (
+            "You are a strict automatic judge for a QA benchmark.\n"
+            "Given a question, the ground truth answer, and a model's answer, "
+            "assign a numerical score between 0.0 and 1.0 indicating how "
+            "correct the model's answer is relative to the ground truth answer.\n"
+            "1.0 = perfectly correct and equivalent; 0.0 = completely wrong.\n"
+            "Be robust to minor paraphrases or formatting differences. Focus only on the accuracy of the answer compared to the reference, not semantic differences. \n"
+            "Do not penalize the model for being more verbose than the reference, as long as the additional information is correct."
+            "Return ONLY the numeric score as a decimal number, with no explanation."
+        )
+        
+        user_prompt = (
+            f"Question: {question}\n\n"
+            f"Gold answer: {reference}\n\n"
+            f"Model answer: {prediction}\n\n"
+            "Score (0.0-1.0):"
+        )
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=16,
+                temperature=0.0,
+                timeout=self.timeout,
+            )
+            content = (response.choices[0].message.content or "").strip()
+            if not content:
+                return None
+            first_token = content.split()[0]
+            score = float(first_token)
+            # Clamp to [0, 1]
+            if score < 0.0:
+                score = 0.0
+            if score > 1.0:
+                score = 1.0
+            return score
+        except Exception as e:
+            logging.warning(f"LLM judge error: {e}")
+            return None
+    
+    def score_results(self, eval_results: EvaluationResults):
+        """
+        Attach 'llm_judge' scores to each QuestionResult in-place.
+        
+        Uses a small thread pool to avoid slowing evaluation too much.
+        """
+        if not self.client:
+            return
+        if not eval_results.results:
+            return
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_result = {}
+            for r in eval_results.results:
+                future = executor.submit(
+                    self._score_single,
+                    r.question,
+                    r.reference,
+                    r.prediction,
+                )
+                future_to_result[future] = r
+            
+            for future in as_completed(future_to_result):
+                result = future_to_result[future]
+                score = future.result()
+                if score is not None:
+                    result.metrics["llm_judge"] = score
 
 
 # ============================================================================
@@ -336,7 +449,8 @@ class AMSEvaluator:
         samples: List[LoCoMoSample],
         questions: Optional[List[Tuple[int, QA]]] = None,
         cache_dir: Optional[Path] = None,
-        logger: Optional[logging.Logger] = None
+        artifact_dir: Optional[Path] = None,
+        logger: Optional[logging.Logger] = None,
     ) -> EvaluationResults:
         """
         Evaluate AMS on the given samples.
@@ -394,8 +508,6 @@ class AMSEvaluator:
             # Answer questions
             log.info(f"Sample {sample_idx}: Answering {len(sample_qas)} questions...")
             for q_idx, qa in enumerate(tqdm(sample_qas, desc=f"Sample {sample_idx}", leave=False)):
-                if self.debug:
-                    log.info(f"  [DEBUG] Q{q_idx+1}/{len(sample_qas)}: {qa.question[:80]}...")
                 
                 prediction, thinking, retrieved, intent, artifact_summaries, retrieval_path = self.answer_question(qa)
                 
@@ -407,13 +519,6 @@ class AMSEvaluator:
                     reference = qa.final_answer or qa.answer or ""
                 metrics = calculate_metrics(prediction, reference)
                 total_artifacts_retrieved += retrieved
-                
-                if self.debug:
-                    log.info(f"  [DEBUG] Answer: {str(prediction)[:100]}...")
-                    log.info(f"  [DEBUG] Reference: {str(reference)[:100]}...")
-                    log.info(f"  [DEBUG] F1={metrics.get('f1', 0):.3f}, EM={metrics.get('exact_match', 0)}, "
-                             f"BERT={metrics.get('bert_f1', 0):.3f}, SBERT={metrics.get('sbert_similarity', 0):.3f}, "
-                             f"Retrieved={retrieved}, Path={retrieval_path or 'unknown'}")
                 
                 result = QuestionResult(
                     sample_id=sample_idx,
@@ -434,6 +539,16 @@ class AMSEvaluator:
                 results.category_counts[qa.category or 1] += 1
                 
                 log.debug(f"Q: {qa.question[:50]}... -> {prediction[:50]}... (F1: {metrics['f1']:.2f})")
+
+            # Optionally save full artifact store for this sample
+            if artifact_dir:
+                sample_artifact_path = artifact_dir / f"sample_{sample_idx}"
+                sample_artifact_path.mkdir(parents=True, exist_ok=True)
+                try:
+                    self.agent.save(sample_artifact_path)
+                    log.info(f"Sample {sample_idx}: saved artifacts to {sample_artifact_path}")
+                except Exception as e:
+                    log.warning(f"Failed to save artifacts for sample {sample_idx}: {e}")
         
         # Calculate aggregate metrics
         results.aggregate_metrics = self._aggregate_metrics(results.results)
@@ -737,7 +852,8 @@ def print_comparison(ams_results: EvaluationResults, amem_results: Optional[Eval
     print("=" * 70)
     
     # Key metrics to display (from a-mem utils.py)
-    KEY_METRICS = ["exact_match", "f1", "rouge1_f", "rougeL_f", "bleu1", "bert_f1", "meteor", "sbert_similarity"]
+    # Includes optional LLM-as-a-judge metric if present.
+    KEY_METRICS = ["exact_match", "f1", "rouge1_f", "rougeL_f", "bleu1", "bert_f1", "meteor", "sbert_similarity", "llm_judge"]
     
     def print_system_results(results: EvaluationResults, name: str):
         print(f"\n{name} ({results.model})")
@@ -916,7 +1032,9 @@ Examples:
     parser.add_argument("--output", type=str, default=None,
                         help="Path to save results JSON")
     parser.add_argument("--cache_dir", type=str, default=None,
-                        help="Directory to cache ingested samples")
+                        help="Directory to cache ingested samples (default: <script_dir>/cache)")
+    parser.add_argument("--artifact_dir", type=str, default=None,
+                        help="Directory to save AMS artifacts per sample (default: <script_dir>/artifacts)")
     parser.add_argument("--log_file", type=str, default=None,
                         help="Path to log file")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -933,6 +1051,13 @@ Examples:
     # Dummy mode for end-to-end testing without burning tokens/time
     parser.add_argument("--dummy", action="store_true",
                         help="Use tiny synthetic dataset for end-to-end testing (5 turns, 2 QAs, ~5 min total)")
+    
+    # LLM-as-a-judge options (Together AI)
+    parser.add_argument("--llm_judge_model", type=str, default="meta-llama/Meta-Llama-3-70B-Instruct-Turbo",
+                        help="Together AI model name for LLM-as-a-judge (e.g. meta-llama/Meta-Llama-3-70B-Instruct-Turbo). "
+                             "If not set, LLM-as-a-judge is disabled.")
+    parser.add_argument("--llm_judge_max_workers", type=int, default=20,
+                        help="Max parallel requests for LLM judge (Together API).")
     
     args = parser.parse_args()
     
@@ -951,7 +1076,9 @@ Examples:
             logger.error(f"Dataset not found: {dataset_path}")
             sys.exit(1)
     
-    cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    base_dir = Path(__file__).parent
+    cache_dir = Path(args.cache_dir) if args.cache_dir else (base_dir / "cache")
+    artifact_dir = Path(args.artifact_dir) if args.artifact_dir else (base_dir / "artifacts")
     output_path = Path(args.output) if args.output else None
     
     # Load dataset (or use dummy for end-to-end testing)
@@ -1017,6 +1144,7 @@ Examples:
         samples=samples,
         questions=questions,
         cache_dir=cache_dir / "ams" if cache_dir else None,
+        artifact_dir=artifact_dir,
         logger=logger,
     )
     
@@ -1041,6 +1169,35 @@ Examples:
             )
         else:
             logger.warning("A-MEM not available for comparison")
+    
+    # Optional: run LLM-as-a-judge over results (Together AI)
+    if args.llm_judge_model:
+        logger.info("=" * 50)
+        logger.info("Running LLM-as-a-judge evaluation (Together AI)")
+        logger.info("=" * 50)
+        
+        judge = LLMJudge(
+            model=args.llm_judge_model,
+            max_workers=args.llm_judge_max_workers,
+        )
+        
+        # Score AMS results
+        judge.score_results(ams_results)
+        # Recompute aggregate metrics to include 'llm_judge'
+        if ams_results.results:
+            ams_results.aggregate_metrics = amem_aggregate_metrics(
+                [r.metrics for r in ams_results.results],
+                [r.category for r in ams_results.results],
+            )
+        
+        # Score A-MEM results if present
+        if amem_results:
+            judge.score_results(amem_results)
+            if amem_results.results:
+                amem_results.aggregate_metrics = amem_aggregate_metrics(
+                    [r.metrics for r in amem_results.results],
+                    [r.category for r in amem_results.results],
+                )
     
     # Print results
     print_comparison(ams_results, amem_results)
