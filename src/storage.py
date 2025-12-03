@@ -14,9 +14,14 @@ from uuid import uuid4
 import json
 import pickle
 from pathlib import Path
+import warnings
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+
+# Suppress transformers warnings about uninitialized pooler weights
+# (not relevant for embedding models used for semantic search)
+warnings.filterwarnings("ignore", message="Some weights of.*were not initialized")
 
 
 def _normalize_datetime(dt: Optional[datetime]) -> Optional[datetime]:
@@ -329,9 +334,9 @@ class ArtifactStore:
                     continue
             
             # Entity name filter
-            if filters.entity_name and hasattr(artifact, 'name'):
-                if filters.entity_name.lower() not in artifact.name.lower():
-                    continue
+            # if filters.entity_name and hasattr(artifact, 'name'):
+            #     if filters.entity_name.lower() not in artifact.name.lower():
+            #         continue
             
             # Validity status filter
             if filters.validity_status and hasattr(artifact, 'validity_status'):

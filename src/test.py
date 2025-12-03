@@ -167,6 +167,7 @@ class QuestionResult:
     retrieved_artifacts: int
     intent: str
     artifact_summaries: List[str] = field(default_factory=list)
+    retrieval_path: Optional[str] = None  # "fast" or "slow" - whether ContextSelector was skipped
     
     
 @dataclass 
@@ -303,25 +304,32 @@ class AMSEvaluator:
         
         return total_extracted
     
-    def answer_question(self, qa: QA) -> Tuple[str, str, int, str, List[str]]:
+    def answer_question(self, qa: QA) -> Tuple[str, str, int, str, List[str], Optional[str]]:
         """
         Answer a question using the AMS agent.
         
         Returns:
-            Tuple of (prediction, thinking, retrieved_count, intent, artifact_summaries)
+            Tuple of (prediction, thinking, retrieved_count, intent, artifact_summaries, retrieval_path)
         """
         try:
             response = self.agent(qa.question, category=qa.category)
+            # Extract retrieval_path from metadata if available
+            retrieval_path = None
+            if hasattr(response, "metadata") and response.metadata:
+                retrieval_meta = response.metadata.get("retrieval", {})
+                retrieval_path = retrieval_meta.get("retrieval_path")
+            
             return (
                 response.answer,
                 response.thinking,
                 response.retrieved_artifacts,
                 response.intent.value,
-                response.artifact_summaries if hasattr(response, "artifact_summaries") else []
+                response.artifact_summaries if hasattr(response, "artifact_summaries") else [],
+                retrieval_path
             )
         except Exception as e:
             logging.error(f"Error answering question: {e}")
-            return str(e), "", 0, "error", []
+            return str(e), "", 0, "error", [], None
     
     def evaluate(
         self,
@@ -389,7 +397,7 @@ class AMSEvaluator:
                 if self.debug:
                     log.info(f"  [DEBUG] Q{q_idx+1}/{len(sample_qas)}: {qa.question[:80]}...")
                 
-                prediction, thinking, retrieved, intent, artifact_summaries = self.answer_question(qa)
+                prediction, thinking, retrieved, intent, artifact_summaries, retrieval_path = self.answer_question(qa)
                 
                 # For category 5 (adversarial), the ground truth is "Not mentioned in the conversation"
                 # The adversarial_answer field is the TRAP answer, not the correct one!
@@ -405,7 +413,7 @@ class AMSEvaluator:
                     log.info(f"  [DEBUG] Reference: {str(reference)[:100]}...")
                     log.info(f"  [DEBUG] F1={metrics.get('f1', 0):.3f}, EM={metrics.get('exact_match', 0)}, "
                              f"BERT={metrics.get('bert_f1', 0):.3f}, SBERT={metrics.get('sbert_similarity', 0):.3f}, "
-                             f"Retrieved={retrieved}")
+                             f"Retrieved={retrieved}, Path={retrieval_path or 'unknown'}")
                 
                 result = QuestionResult(
                     sample_id=sample_idx,
@@ -418,6 +426,7 @@ class AMSEvaluator:
                     retrieved_artifacts=retrieved,
                     intent=intent,
                     artifact_summaries=artifact_summaries,
+                    retrieval_path=retrieval_path,
                 )
                 
                 results.results.append(result)
@@ -429,10 +438,19 @@ class AMSEvaluator:
         # Calculate aggregate metrics
         results.aggregate_metrics = self._aggregate_metrics(results.results)
         if results.total_questions > 0:
+            # Count fast vs slow retrieval paths
+            fast_path_count = sum(1 for r in results.results if r.retrieval_path == "fast")
+            slow_path_count = sum(1 for r in results.results if r.retrieval_path == "slow")
+            
             results.metadata["artifact_stats"] = {
                 "total_generated": total_generated_artifacts,
                 "total_retrieved": total_artifacts_retrieved,
                 "avg_retrieved_per_question": total_artifacts_retrieved / results.total_questions if results.total_questions else 0,
+            }
+            results.metadata["retrieval_stats"] = {
+                "fast_path_count": fast_path_count,
+                "slow_path_count": slow_path_count,
+                "fast_path_percentage": (fast_path_count / results.total_questions * 100) if results.total_questions > 0 else 0,
             }
         
         return results
@@ -712,18 +730,6 @@ def select_questions(
         return all_questions
 
 
-def compute_metrics_excluding_adversarial(results: EvaluationResults) -> Dict[str, Dict[str, float]]:
-    """Compute aggregate metrics excluding category 5 (adversarial) questions."""
-    non_adversarial = [r for r in results.results if r.category != 5]
-    if not non_adversarial:
-        return {}
-    
-    all_metrics = [r.metrics for r in non_adversarial]
-    all_categories = [r.category for r in non_adversarial]
-    
-    return amem_aggregate_metrics(all_metrics, all_categories)
-
-
 def print_comparison(ams_results: EvaluationResults, amem_results: Optional[EvaluationResults]):
     """Print comparison between AMS and A-MEM results."""
     print("\n" + "=" * 70)
@@ -739,36 +745,28 @@ def print_comparison(ams_results: EvaluationResults, amem_results: Optional[Eval
         print(f"Total questions: {results.total_questions}")
         
         artifact_stats = results.metadata.get("artifact_stats") if results.metadata else None
+        retrieval_stats = results.metadata.get("retrieval_stats") if results.metadata else None
+        
         if artifact_stats:
             print("Artifact / Memory Stats:")
             print(f"  Total generated: {artifact_stats.get('total_generated', 0)}")
             print(f"  Total retrieved/context items: {artifact_stats.get('total_retrieved', 0)}")
             print(f"  Avg retrieved per question: {artifact_stats.get('avg_retrieved_per_question', 0):.2f}")
         
-        # Count adversarial questions
-        n_adversarial = results.category_counts.get(5, 0)
-        n_non_adversarial = results.total_questions - n_adversarial
+        if retrieval_stats:
+            print("Retrieval Path Stats:")
+            print(f"  Fast path (ContextSelector skipped): {retrieval_stats.get('fast_path_count', 0)} ({retrieval_stats.get('fast_path_percentage', 0):.1f}%)")
+            print(f"  Slow path (ContextSelector used): {retrieval_stats.get('slow_path_count', 0)}")
         
         if results.aggregate_metrics:
             overall = results.aggregate_metrics.get("overall", {})
             
-            # Print all key metrics (including adversarial)
-            print(f"\nOverall Metrics (ALL {results.total_questions} questions):")
+            # Print all key metrics
+            print(f"\nOverall Metrics ({results.total_questions} questions):")
             for metric in KEY_METRICS:
                 if metric in overall:
                     val = overall[metric].get("mean", 0)
                     print(f"  {metric:20s}: {val:.4f}")
-            
-            # Compute and print metrics EXCLUDING adversarial
-            if n_adversarial > 0 and n_non_adversarial > 0:
-                non_adv_metrics = compute_metrics_excluding_adversarial(results)
-                if non_adv_metrics:
-                    non_adv_overall = non_adv_metrics.get("overall", {})
-                    print(f"\nOverall Metrics (EXCLUDING {n_adversarial} adversarial, n={n_non_adversarial}):")
-                    for metric in KEY_METRICS:
-                        if metric in non_adv_overall:
-                            val = non_adv_overall[metric].get("mean", 0)
-                            print(f"  {metric:20s}: {val:.4f}")
             
             # Print by category (with F1 and BLEU-1 first)
             print("\nBy Category (F1 / BLEU-1 / BERT-F1 / SBERT):")
@@ -797,7 +795,7 @@ def print_comparison(ams_results: EvaluationResults, amem_results: Optional[Eval
         ams_overall = ams_results.aggregate_metrics.get("overall", {})
         amem_overall = amem_results.aggregate_metrics.get("overall", {})
         
-        print("\nMetric Deltas - ALL questions (AMS - A-MEM):")
+        print("\nMetric Deltas (AMS - A-MEM):")
         for metric in KEY_METRICS:
             ams_val = ams_overall.get(metric, {}).get("mean", 0)
             amem_val = amem_overall.get(metric, {}).get("mean", 0)
@@ -805,26 +803,6 @@ def print_comparison(ams_results: EvaluationResults, amem_results: Optional[Eval
             delta_pct = (delta / amem_val * 100) if amem_val > 0 else 0
             winner = "✅" if delta > 0.001 else ("❌" if delta < -0.001 else "➖")
             print(f"  {metric:20s}: {delta:+.4f} ({delta_pct:+.1f}%) {winner}")
-        
-        # Also show comparison EXCLUDING adversarial
-        n_adv_ams = ams_results.category_counts.get(5, 0)
-        n_adv_amem = amem_results.category_counts.get(5, 0)
-        if n_adv_ams > 0 or n_adv_amem > 0:
-            ams_non_adv = compute_metrics_excluding_adversarial(ams_results)
-            amem_non_adv = compute_metrics_excluding_adversarial(amem_results)
-            
-            if ams_non_adv and amem_non_adv:
-                ams_na_overall = ams_non_adv.get("overall", {})
-                amem_na_overall = amem_non_adv.get("overall", {})
-                
-                print("\nMetric Deltas - EXCLUDING adversarial (AMS - A-MEM):")
-                for metric in KEY_METRICS:
-                    ams_val = ams_na_overall.get(metric, {}).get("mean", 0)
-                    amem_val = amem_na_overall.get(metric, {}).get("mean", 0)
-                    delta = ams_val - amem_val
-                    delta_pct = (delta / amem_val * 100) if amem_val > 0 else 0
-                    winner = "✅" if delta > 0.001 else ("❌" if delta < -0.001 else "➖")
-                    print(f"  {metric:20s}: {delta:+.4f} ({delta_pct:+.1f}%) {winner}")
         
         # Overall verdict based on F1
         ams_f1 = ams_overall.get("f1", {}).get("mean", 0)
