@@ -52,7 +52,7 @@ class QueryRouterSignature(dspy.Signature):
     
     # Structured outputs
     artifact_type: str = dspy.OutputField(
-        desc="Most relevant artifact type: EntityArtifact, EventArtifact, FactArtifact, ReasoningArtifact, or 'any'"
+        desc="Most relevant artifact type: EventArtifact, FactArtifact, ReasoningArtifact, or 'any'"
     )
     temporal_operator: str = dspy.OutputField(
         desc="Temporal operator if query involves time: $gt, $lt, $gte, $lte, $eq, or 'none'"
@@ -65,9 +65,6 @@ class QueryRouterSignature(dspy.Signature):
     )
     intent: str = dspy.OutputField(
         desc="Query intent: factual, temporal, reasoning, or multi_hop"
-    )
-    entity_filter: str = dspy.OutputField(
-        desc="Entity name to filter by, or 'none'"
     )
     topic_tags: str = dspy.OutputField(
         desc="Comma-separated topic tags to filter by, or 'none'"
@@ -191,17 +188,11 @@ class QueryRouter(dspy.Module):
         if result.topic_tags and result.topic_tags.lower() != "none":
             topic_tags = [t.strip() for t in result.topic_tags.split(",") if t.strip()]
         
-        # Parse entity filter
-        entity_filter = None
-        if result.entity_filter and result.entity_filter.lower() != "none":
-            entity_filter = result.entity_filter
-        
         # Build structured filter
         filters = StructuredFilter(
             artifact_type=artifact_type,
             temporal_filter=temporal_filter,
             topic_tags=topic_tags,
-            entity_name=entity_filter,
         )
         
         # Parse intent
@@ -402,7 +393,31 @@ class HybridRetrievalEngine:
             )
             metadata["hops"] = hop_metadata
         
-        # Stage 2: Context selection
+        # Decide whether to run the expensive ContextSelector
+        use_fast_path = intent == QueryIntent.FACTUAL or len(search_results) <= k_stage2
+        
+        if use_fast_path:
+            metadata["retrieval_path"] = "fast"
+            selected_artifacts = []
+            selected_ids = []
+            for artifact_id, _ in search_results[:k_stage2]:
+                artifact = self.store.get_artifact(artifact_id)
+                if artifact:
+                    selected_artifacts.append(artifact)
+                    selected_ids.append(artifact_id)
+            
+            metadata["stages"].append({
+                "stage": 2,
+                "path": "fast",
+                "selected": len(selected_ids),
+                "reasoning": "Skipped ContextSelector for simple/factual query"
+            })
+            
+            return selected_artifacts, metadata
+        
+        metadata["retrieval_path"] = "slow"
+        
+        # Stage 2: Context selection (LLM reasoning path)
         candidates = []
         for artifact_id, score in search_results:
             artifact = self.store.get_artifact(artifact_id)

@@ -21,7 +21,6 @@ from pydantic import BaseModel, Field
 
 from schemas import (
     Artifact,
-    EntityArtifact,
     EventArtifact,
     FactArtifact,
     ReasoningArtifact,
@@ -116,7 +115,7 @@ class TemporalAnswerSignature(dspy.Signature):
         desc="Analysis of the temporal aspects and timeline"
     )
     answer: str = dspy.OutputField(
-        desc="ONLY the date/time answer in natural format like '7 May 2023' or '2022'. No full sentences, just the temporal answer."
+        desc="ONLY the date/time answer in a natural format like '7 May 2023', '2022', or 'The Thursday before 7 May 2023' [the format of your answer should be the same format as the contextual evidence]. No full sentences, just the temporal answer."
     )
 
 
@@ -351,19 +350,7 @@ class AMSAgent(dspy.Module):
         conversation_context = self._build_conversation_context()
         
         # =========================================
-        # Step 1: Input Processing via QueryRouter
-        # =========================================
-        filters, semantic_query, intent = self.retrieval_engine.query_router(
-            user_query=user_input,
-            conversation_context=conversation_context
-        )
-        
-        # Override intent based on LoCoMo category if provided
-        if category:
-            intent = self._map_category_to_intent(category)
-        
-        # =========================================
-        # Step 2: Retrieval Stage 1 and 2 (semantic search [ + optional filter] -> agent chooses most relevant artifacts)
+        # Step 1: Retrieval Stage 1 and 2 (semantic search [ + optional filter] -> agent chooses most relevant artifacts)
         # =========================================
         artifacts, retrieval_metadata = self.retrieval_engine.retrieve(
             user_query=user_input,
@@ -372,21 +359,40 @@ class AMSAgent(dspy.Module):
             k_stage2=self.k_stage2
         )
         
+        # Base intent from retrieval metadata
+        intent_value = retrieval_metadata.get("intent", QueryIntent.FACTUAL.value)
+        try:
+            intent = QueryIntent(intent_value)
+        except ValueError:
+            intent = QueryIntent.FACTUAL
+        # Override intent based on LoCoMo category if provided (for generation side only)
+        if category:
+            intent = self._map_category_to_intent(category)
+        
         # Build context from retrieved artifacts
         context = self._build_context(artifacts)
         artifact_summaries = [artifact.get_summary() for artifact in artifacts]
         
         # =========================================
-        # Step 3: Retrieve reasoning strategies
+        # Step 3: Retrieve reasoning strategies (only for relevant categories/intents)
         # =========================================
-        goal_category = self._intent_to_goal_category(intent)
-        strategies = self.retrieval_engine.retrieve_for_reasoning(
-            goal_category=goal_category,
-            user_query=user_input,
-            min_rating=3
-        )
-        strategies_context = self._build_strategies_context(strategies)
-        reasoning_applied = len(strategies) > 0
+        should_use_strategies = False
+        if category in {1, 3, 4}:
+            should_use_strategies = True
+        elif category is None:
+            should_use_strategies = intent != QueryIntent.TEMPORAL
+        
+        strategies_context = ""
+        reasoning_applied = False
+        if should_use_strategies:
+            goal_category = self._intent_to_goal_category(intent)
+            strategies = self.retrieval_engine.retrieve_for_reasoning(
+                goal_category=goal_category,
+                user_query=user_input,
+                min_rating=3
+            )
+            strategies_context = self._build_strategies_context(strategies)
+            reasoning_applied = len(strategies) > 0
         
         # =========================================
         # Step 4: Generation with CoT
@@ -421,8 +427,8 @@ class AMSAgent(dspy.Module):
             reasoning_applied=reasoning_applied,
             artifact_summaries=artifact_summaries,
             metadata={
-                "filters": filters.model_dump() if filters else {},
-                "semantic_query": semantic_query,
+                "filters": retrieval_metadata.get("filters", {}),
+                "semantic_query": retrieval_metadata.get("semantic_query", ""),
                 "retrieval": retrieval_metadata,
                 "artifact_summaries": artifact_summaries,
             }

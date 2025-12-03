@@ -16,7 +16,6 @@ from pathlib import Path
 import dspy
 
 from schemas import (
-    EntityArtifact,
     EventArtifact,
     FactArtifact,
     ReasoningArtifact,

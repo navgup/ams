@@ -41,7 +41,6 @@ class QueryIntent(str, Enum):
 
 class ArtifactType(str, Enum):
     """Enumeration of all artifact types for filtering."""
-    ENTITY = "EntityArtifact"
     EVENT = "EventArtifact"
     FACT = "FactArtifact"
     REASONING = "ReasoningArtifact"
@@ -138,75 +137,6 @@ class Artifact(BaseModel):
     def to_context_string(self) -> str:
         """Convert artifact to a string suitable for LLM context."""
         return self.get_summary()
-
-
-# ============================================================================
-# Entity Artifact
-# ============================================================================
-
-class EntityArtifact(Artifact):
-    """
-    Represents a person, place, or object in the conversation.
-    
-    Examples:
-    - "Taylor Hawkins" (person)
-    - "Stanford University" (place)
-    - "The red bicycle" (object)
-    """
-    
-    name: str = Field(
-        ...,
-        description="Primary name of the entity"
-    )
-    summary: str = Field(
-        ...,
-        description="Brief description of the entity"
-    )
-    aliases: List[str] = Field(
-        default_factory=list,
-        description="Alternative names or references"
-    )
-    entity_type: Optional[str] = Field(
-        default=None,
-        description="Type of entity (person, place, object, organization)"
-    )
-    attributes: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Key-value attributes about the entity"
-    )
-    related_entity_ids: List[str] = Field(
-        default_factory=list,
-        description="IDs of related entities"
-    )
-    
-    def get_embedding_text(self) -> str:
-        """Generate text for embedding."""
-        parts = [self.name, self.summary]
-        if self.aliases:
-            parts.append(f"Also known as: {', '.join(self.aliases)}")
-        if self.entity_type:
-            parts.append(f"Type: {self.entity_type}")
-        if self.attributes:
-            attrs = ", ".join(f"{k}: {v}" for k, v in self.attributes.items())
-            parts.append(f"Attributes: {attrs}")
-        return " | ".join(parts)
-    
-    def get_summary(self) -> str:
-        """Return brief summary."""
-        return f"[Entity] {self.name}: {self.summary[:100]}..."
-    
-    def to_context_string(self) -> str:
-        """Convert to LLM context string."""
-        lines = [f"Entity: {self.name}"]
-        lines.append(f"Description: {self.summary}")
-        if self.aliases:
-            lines.append(f"Also known as: {', '.join(self.aliases)}")
-        if self.entity_type:
-            lines.append(f"Type: {self.entity_type}")
-        if self.attributes:
-            for k, v in self.attributes.items():
-                lines.append(f"  {k}: {v}")
-        return "\n".join(lines)
 
 
 # ============================================================================
@@ -533,7 +463,6 @@ class ConversationTurnArtifact(Artifact):
 # ============================================================================
 
 ARTIFACT_TYPES: Dict[str, type] = {
-    "EntityArtifact": EntityArtifact,
     "EventArtifact": EventArtifact,
     "FactArtifact": FactArtifact,
     "ReasoningArtifact": ReasoningArtifact,
@@ -588,10 +517,6 @@ class StructuredFilter(BaseModel):
         default=None,
         description="Filter by topic tags"
     )
-    entity_name: Optional[str] = Field(
-        default=None,
-        description="Filter by entity name"
-    )
     validity_status: Optional[ValidityStatus] = Field(
         default=None,
         description="Filter facts by validity status"
@@ -618,9 +543,6 @@ class StructuredFilter(BaseModel):
         
         if self.topic_tags:
             filters["topic_tags"] = {"$in": self.topic_tags}
-        
-        if self.entity_name:
-            filters["name"] = {"$regex": self.entity_name, "$options": "i"}
         
         if self.validity_status:
             filters["validity_status"] = self.validity_status.value

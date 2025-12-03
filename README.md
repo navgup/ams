@@ -25,9 +25,12 @@ Unlike standard RAG or A-MEM (which uses generic JSON notes), AMS:
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │              ArtifactStore (Versioned)                   │   │
 │  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌───────────────────┐ │   │
-│  │  │Entity  │ │Event   │ │Fact    │ │ReasoningArtifact  │ │   │
+│  │  │Event   │ │Fact    │ │Summary │ │ReasoningArtifact  │ │   │
 │  │  │Artifact│ │Artifact│ │Artifact│ │(Meta-Cognitive)   │ │   │
 │  │  └────────┘ └────────┘ └────────┘ └───────────────────┘ │   │
+│  │  ┌──────────────────────────────────────────────────┐  │   │
+│  │  │    ConversationTurnArtifact (Raw Input)          │  │   │
+│  │  └──────────────────────────────────────────────────┘  │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │         ▲                                                       │
 │         │              ┌────────────────────┐                  │
@@ -43,11 +46,11 @@ Unlike standard RAG or A-MEM (which uses generic JSON notes), AMS:
 
 Strict Pydantic models for all artifact types:
 
-- **`EntityArtifact`**: People, places, objects with attributes and aliases
 - **`EventArtifact`**: Time-bound events (crucial for temporal reasoning)
 - **`FactArtifact`**: Atomic claims with validity status and conflict tracking
+- **`SummaryArtifact`**: Consolidated facts and summaries
 - **`ReasoningArtifact`**: Reusable reasoning patterns (meta-cognitive layer)
-- **`SummaryArtifact`**: Consolidated facts/entities
+- **`ConversationTurnArtifact`**: Raw conversation turns for reference
 
 ### 2. Storage (`storage.py`)
 
@@ -96,8 +99,11 @@ pip install -r requirements.txt
 
 ## Quick Start
 
+### Basic Usage
+
 ```python
 from agent import create_ams_agent
+from datetime import datetime
 
 # Create agent
 agent = create_ams_agent(
@@ -113,10 +119,38 @@ agent.ingest_conversation(
 )
 
 # Answer questions
-response = agent.forward("Where does Alice work?")
+response = agent("Where does Alice work?")
 print(response.answer)  # "TechCorp"
 print(response.thinking)  # Shows reasoning trace
 ```
+
+### Evaluation on LoCoMo Benchmark
+
+```bash
+# Run evaluation on LoCoMo dataset
+cd src
+python test.py --n_samples 1
+
+# Compare against A-MEM baseline
+python test.py --n_samples 1 --compare_amem
+
+# With LLM-as-a-judge (Together AI)
+export TOGETHER_API_KEY="your-key"
+python test.py --n_samples 1 --llm_judge_model meta-llama/Meta-Llama-3-70B-Instruct-Turbo
+
+# Artifacts are automatically saved to ./artifacts/ and ./cache/
+```
+
+## Evaluation & Metrics
+
+The `test.py` script provides comprehensive evaluation on the LoCoMo benchmark:
+
+- **Standard Metrics**: Exact Match, F1, ROUGE, BLEU, BERT-F1, METEOR, SBERT
+- **LLM-as-a-Judge**: Optional semantic correctness scoring via Together AI
+- **A-MEM Comparison**: Side-by-side comparison with baseline
+- **Artifact Persistence**: Automatic saving of artifacts and caches
+
+Results are saved as JSON with per-question and aggregate metrics, broken down by LoCoMo category.
 
 ## Key Differences from A-MEM
 
@@ -128,6 +162,7 @@ print(response.thinking)  # Shows reasoning trace
 | Temporal | String timestamps | `datetime` with structured filtering |
 | Retrieval | Simple embedding | Two-stage with QueryRouter |
 | Framework | Raw prompts | DSPy Signatures & Modules |
+| Entities | Explicit entity tracking | Implicit via Facts/Events |
 
 ## Requirements
 
@@ -136,6 +171,24 @@ print(response.thinking)  # Shows reasoning trace
 - Pydantic 2.0+
 - sentence-transformers
 - OpenAI API key (or Ollama for local)
+- Together AI API key (optional, for LLM-as-a-judge evaluation)
+
+## File Structure
+
+```
+ams/
+├── src/
+│   ├── agent.py          # Main AMSAgent class
+│   ├── schemas.py        # Artifact type definitions
+│   ├── storage.py         # ArtifactStore with versioning
+│   ├── retrieval.py      # Hybrid retrieval engine
+│   ├── lifecycle.py      # Artifact extraction & consolidation
+│   ├── test.py           # LoCoMo evaluation script
+│   └── requirements.txt
+├── cache/                # Default cache directory (auto-created)
+├── artifacts/            # Default artifact storage (auto-created)
+└── results/              # Evaluation results JSON files
+```
 
 ## License
 
