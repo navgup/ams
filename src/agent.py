@@ -374,16 +374,25 @@ class AMSAgent(dspy.Module):
         artifact_summaries = [artifact.get_summary() for artifact in artifacts]
         
         # =========================================
-        # Step 3: Retrieve reasoning strategies
+        # Step 3: Retrieve reasoning strategies (only for relevant categories/intents)
         # =========================================
-        goal_category = self._intent_to_goal_category(intent)
-        strategies = self.retrieval_engine.retrieve_for_reasoning(
-            goal_category=goal_category,
-            user_query=user_input,
-            min_rating=3
-        )
-        strategies_context = self._build_strategies_context(strategies)
-        reasoning_applied = len(strategies) > 0
+        should_use_strategies = False
+        if category in {1, 3, 4}:
+            should_use_strategies = True
+        elif category is None:
+            should_use_strategies = intent != QueryIntent.TEMPORAL
+        
+        strategies_context = ""
+        reasoning_applied = False
+        if should_use_strategies:
+            goal_category = self._intent_to_goal_category(intent)
+            strategies = self.retrieval_engine.retrieve_for_reasoning(
+                goal_category=goal_category,
+                user_query=user_input,
+                min_rating=3
+            )
+            strategies_context = self._build_strategies_context(strategies)
+            reasoning_applied = len(strategies) > 0
         
         # =========================================
         # Step 4: Generation with CoT
