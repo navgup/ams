@@ -22,3 +22,6 @@ rouge-score>=0.1.2
 nltk>=3.8.0
 bert-score>=0.3.13
 
+# Environment variables
+python-dotenv>=1.0.0
+

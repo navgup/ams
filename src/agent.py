@@ -350,19 +350,7 @@ class AMSAgent(dspy.Module):
         conversation_context = self._build_conversation_context()
         
         # =========================================
-        # Step 1: Input Processing via QueryRouter
-        # =========================================
-        filters, semantic_query, intent = self.retrieval_engine.query_router(
-            user_query=user_input,
-            conversation_context=conversation_context
-        )
-        
-        # Override intent based on LoCoMo category if provided
-        if category:
-            intent = self._map_category_to_intent(category)
-        
-        # =========================================
-        # Step 2: Retrieval Stage 1 and 2 (semantic search [ + optional filter] -> agent chooses most relevant artifacts)
+        # Step 1: Retrieval Stage 1 and 2 (semantic search [ + optional filter] -> agent chooses most relevant artifacts)
         # =========================================
         artifacts, retrieval_metadata = self.retrieval_engine.retrieve(
             user_query=user_input,
@@ -370,6 +358,16 @@ class AMSAgent(dspy.Module):
             k_stage1=self.k_stage1,
             k_stage2=self.k_stage2
         )
+        
+        # Base intent from retrieval metadata
+        intent_value = retrieval_metadata.get("intent", QueryIntent.FACTUAL.value)
+        try:
+            intent = QueryIntent(intent_value)
+        except ValueError:
+            intent = QueryIntent.FACTUAL
+        # Override intent based on LoCoMo category if provided (for generation side only)
+        if category:
+            intent = self._map_category_to_intent(category)
         
         # Build context from retrieved artifacts
         context = self._build_context(artifacts)
@@ -420,8 +418,8 @@ class AMSAgent(dspy.Module):
             reasoning_applied=reasoning_applied,
             artifact_summaries=artifact_summaries,
             metadata={
-                "filters": filters.model_dump() if filters else {},
-                "semantic_query": semantic_query,
+                "filters": retrieval_metadata.get("filters", {}),
+                "semantic_query": retrieval_metadata.get("semantic_query", ""),
                 "retrieval": retrieval_metadata,
                 "artifact_summaries": artifact_summaries,
             }

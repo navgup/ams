@@ -37,6 +37,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ast
 
+# Try to load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed, skip .env loading
+
 import dspy
 from dateutil import parser as dateutil_parser
 from tqdm import tqdm
@@ -177,6 +184,7 @@ class QuestionResult:
     intent: str
     artifact_summaries: List[str] = field(default_factory=list)
     retrieval_path: Optional[str] = None  # "fast" or "slow" - whether ContextSelector was skipped
+    reasoning_applied: bool = False  # Whether a stored reasoning strategy was applied
     
     
 @dataclass 
@@ -202,7 +210,7 @@ class LLMJudge:
     def __init__(
         self,
         model: str,
-        max_workers: int = 20,
+        max_workers: int = 10,
         timeout: float = 15.0,
         base_url: str = "https://api.together.xyz/v1",
     ):
@@ -417,15 +425,15 @@ class AMSEvaluator:
         
         return total_extracted
     
-    def answer_question(self, qa: QA) -> Tuple[str, str, int, str, List[str], Optional[str]]:
+    def answer_question(self, qa: QA) -> Tuple[str, str, int, str, List[str], Optional[str], bool]:
         """
         Answer a question using the AMS agent.
         
         Returns:
-            Tuple of (prediction, thinking, retrieved_count, intent, artifact_summaries, retrieval_path)
+            Tuple of (prediction, thinking, retrieved_count, intent, artifact_summaries, retrieval_path, reasoning_applied)
         """
         try:
-            response = self.agent(qa.question, category=qa.category)
+            response = self.agent(qa.question)
             # Extract retrieval_path from metadata if available
             retrieval_path = None
             if hasattr(response, "metadata") and response.metadata:
@@ -438,11 +446,12 @@ class AMSEvaluator:
                 response.retrieved_artifacts,
                 response.intent.value,
                 response.artifact_summaries if hasattr(response, "artifact_summaries") else [],
-                retrieval_path
+                retrieval_path,
+                response.reasoning_applied if hasattr(response, "reasoning_applied") else False
             )
         except Exception as e:
             logging.error(f"Error answering question: {e}")
-            return str(e), "", 0, "error", [], None
+            return str(e), "", 0, "error", [], None, False
     
     def evaluate(
         self,
@@ -509,7 +518,7 @@ class AMSEvaluator:
             log.info(f"Sample {sample_idx}: Answering {len(sample_qas)} questions...")
             for q_idx, qa in enumerate(tqdm(sample_qas, desc=f"Sample {sample_idx}", leave=False)):
                 
-                prediction, thinking, retrieved, intent, artifact_summaries, retrieval_path = self.answer_question(qa)
+                prediction, thinking, retrieved, intent, artifact_summaries, retrieval_path, reasoning_applied = self.answer_question(qa)
                 
                 # For category 5 (adversarial), the ground truth is "Not mentioned in the conversation"
                 # The adversarial_answer field is the TRAP answer, not the correct one!
@@ -532,6 +541,7 @@ class AMSEvaluator:
                     intent=intent,
                     artifact_summaries=artifact_summaries,
                     retrieval_path=retrieval_path,
+                    reasoning_applied=reasoning_applied,
                 )
                 
                 results.results.append(result)
@@ -885,7 +895,7 @@ def print_comparison(ams_results: EvaluationResults, amem_results: Optional[Eval
                     print(f"  {metric:20s}: {val:.4f}")
             
             # Print by category (with F1 and BLEU-1 first)
-            print("\nBy Category (F1 / BLEU-1 / BERT-F1 / SBERT):")
+            print("\nBy Category (F1 / BLEU-1 / BERT-F1 / SBERT / LLM-Judge):")
             for cat in sorted(results.category_counts.keys()):
                 cat_key = f"category_{cat}"
                 if cat_key in results.aggregate_metrics:
@@ -894,9 +904,11 @@ def print_comparison(ams_results: EvaluationResults, amem_results: Optional[Eval
                     cat_bleu1 = cat_metrics.get("bleu1", {}).get("mean", 0)
                     cat_bert = cat_metrics.get("bert_f1", {}).get("mean", 0)
                     cat_sbert = cat_metrics.get("sbert_similarity", {}).get("mean", 0)
+                    cat_llm = cat_metrics.get("llm_judge", {}).get("mean")
+                    cat_llm_display = f"{cat_llm:.3f}" if cat_llm is not None else "N/A"
                     count = results.category_counts[cat]
                     cat_label = f"Cat {cat}" if cat != 5 else "Cat 5 (adv)"
-                    print(f"  {cat_label}: {cat_f1:.3f} / {cat_bleu1:.3f} / {cat_bert:.3f} / {cat_sbert:.3f} (n={count})")
+                    print(f"  {cat_label}: {cat_f1:.3f} / {cat_bleu1:.3f} / {cat_bert:.3f} / {cat_sbert:.3f} / {cat_llm_display} (n={count})")
     
     print_system_results(ams_results, "AMS (Agent Memory Scaffolding)")
     
@@ -1056,7 +1068,7 @@ Examples:
     parser.add_argument("--llm_judge_model", type=str, default="meta-llama/Meta-Llama-3-70B-Instruct-Turbo",
                         help="Together AI model name for LLM-as-a-judge (e.g. meta-llama/Meta-Llama-3-70B-Instruct-Turbo). "
                              "If not set, LLM-as-a-judge is disabled.")
-    parser.add_argument("--llm_judge_max_workers", type=int, default=20,
+    parser.add_argument("--llm_judge_max_workers", type=int, default=10,
                         help="Max parallel requests for LLM judge (Together API).")
     
     args = parser.parse_args()
