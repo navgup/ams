@@ -18,6 +18,33 @@ Usage:
     
     # Run on specific categories
     python test.py --categories 1 2 3 --ratio 0.5
+
+
+    A-MEM (Baseline) (gpt-4o-mini)
+------------------------------------------------------------
+Total questions: 199
+Artifact / Memory Stats:
+  Total generated: 419
+  Total retrieved/context items: 0
+  Avg retrieved per question: 0.00
+
+Overall Metrics (199 questions):
+  exact_match         : 0.0452
+  f1                  : 0.4800
+  rouge1_f            : 0.4902
+  rougeL_f            : 0.4798
+  bleu1               : 0.3892
+  bert_f1             : 0.9138
+  meteor              : 0.3438
+  sbert_similarity    : 0.5906
+  llm_judge           : 0.5975 
+
+By Category (F1 / BLEU-1 / BERT-F1 / SBERT):
+  Cat 1: 0.153 / 0.103 / 0.865 / 0.360 (n=32)
+  Cat 2: 0.492 / 0.370 / 0.911 / 0.690 (n=37)
+  Cat 3: 0.210 / 0.167 / 0.875 / 0.322 (n=13)
+  Cat 4: 0.437 / 0.368 / 0.909 / 0.549 (n=70)
+  Cat 5 (adv): 0.832 / 0.693 / 0.966 / 0.805 (n=47)
 """
 
 import os
@@ -433,7 +460,8 @@ class AMSEvaluator:
             Tuple of (prediction, thinking, retrieved_count, intent, artifact_summaries, retrieval_path, reasoning_applied)
         """
         try:
-            response = self.agent(qa.question)
+            force_adversarial = (qa.category == 5)
+            response = self.agent(qa.question, force_adversarial=force_adversarial)
             # Extract retrieval_path from metadata if available
             retrieval_path = None
             if hasattr(response, "metadata") and response.metadata:
@@ -746,13 +774,26 @@ class AMEMEvaluator:
         context = memory_system.find_related_memories_raw(qa.question, k=self.retrieve_k)
         
         # Generate answer (simplified - using the memory system's LLM)
-        prompt = f"""Based on the context: {context}
-        
-        Answer the following question. Return ONLY the direct answer - concise, no explanations. If unanswerable, ONLY return 'Not mentioned in the conversation'.
-        
-        Question: {qa.question}
-        
-        Answer:"""
+        if qa.category == 5:
+            prompt = f"""You must determine whether the question can be answered from the provided conversation context.
+            
+            Context:
+            {context}
+            
+            Question: {qa.question}
+            
+            If the context clearly supports the answer, return ONLY the direct answer (no explanations, no extra words).
+            If the context does NOT contain the necessary information or contradicts the question's premise, return ONLY 'Not mentioned in the conversation'.
+            
+            Answer:"""
+        else:
+            prompt = f"""Based on the context: {context}
+            
+            Answer the following question. Return ONLY the direct answer - concise, no explanations.
+            
+            Question: {qa.question}
+            
+            Answer:"""
         
         response = memory_system.llm_controller.llm.get_completion(
             prompt,

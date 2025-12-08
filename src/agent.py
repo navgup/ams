@@ -59,7 +59,7 @@ class AnswerWithReasoningSignature(dspy.Signature):
         desc="Step-by-step reasoning process - be explicit about your logic chain"
     )
     answer: str = dspy.OutputField(
-        desc="ONLY the direct answer - extremely concise, no explanations. For names give just the name. For dates use natural format like '7 May 2023'. Match the expected answer format."
+        desc="ONLY the direct answer - extremely concise, no explanations. For names give just the name. For dates use natural format like '7 May 2023'. Match the expected answer format. If the question is not answerable, return ONLY 'Not mentioned in the conversation'."
     )
 
 
@@ -107,15 +107,11 @@ class TemporalAnswerSignature(dspy.Signature):
     context: str = dspy.InputField(
         desc="Retrieved events and facts with timestamps"
     )
-    current_date: str = dspy.InputField(
-        desc="Current date for reference"
-    )
-    
     temporal_reasoning: str = dspy.OutputField(
         desc="Analysis of the temporal aspects and timeline"
     )
     answer: str = dspy.OutputField(
-        desc="ONLY the date/time answer in a natural format like '7 May 2023', '2022', or 'The Thursday before 7 May 2023' [the format of your answer should be the same format as the contextual evidence]. No full sentences, just the temporal answer."
+        desc="ONLY the date/time answer in a natural format like '7 May 2023', '2022', or 'The Thursday before 7 May 2023' [the format of your answer should be the same format as the contextual evidence -- Do NOT attempt to compute numeric dates from the contextual evidence and instead just use the given phrasing to form your answer]. No full sentences, just the temporal answer."
     )
 
 
@@ -215,7 +211,6 @@ class TemporalGenerator(dspy.Module):
         self,
         user_query: str,
         context: str,
-        current_date: Optional[datetime] = None
     ) -> Tuple[str, str]:
         """
         Generate temporal answer.
@@ -223,12 +218,9 @@ class TemporalGenerator(dspy.Module):
         Returns:
             Tuple of (temporal_reasoning, answer)
         """
-        date_str = (current_date or datetime.utcnow()).strftime("%Y-%m-%d")
-        
         result = self.generator(
             user_query=user_query,
             context=context,
-            current_date=date_str
         )
         return result.temporal_reasoning, result.answer
 
@@ -334,14 +326,13 @@ class AMSAgent(dspy.Module):
     def forward(
         self,
         user_input: str,
-        category: Optional[int] = None
+        force_adversarial: bool = False,
     ) -> AMSAgentResponse:
         """
         Main agent loop - process user input and generate response.
         
         Args:
             user_input: The user's question or message
-            category: Optional LoCoMo category (1-5) for specialized handling
             
         Returns:
             AMSAgentResponse with answer and metadata
@@ -359,32 +350,89 @@ class AMSAgent(dspy.Module):
             k_stage2=self.k_stage2
         )
         
-        # Base intent from retrieval metadata
+        # Get intent from retrieval metadata
         intent_value = retrieval_metadata.get("intent", QueryIntent.FACTUAL.value)
         try:
             intent = QueryIntent(intent_value)
         except ValueError:
             intent = QueryIntent.FACTUAL
-        # Override intent based on LoCoMo category if provided (for generation side only)
-        if category:
-            intent = self._map_category_to_intent(category)
         
         # Build context from retrieved artifacts
         context = self._build_context(artifacts)
         artifact_summaries = [artifact.get_summary() for artifact in artifacts]
         
         # =========================================
-        # Step 3: Retrieve reasoning strategies (only for relevant categories/intents)
+        # Optional: Force adversarial path (used when ground-truth category is adversarial)
         # =========================================
-        should_use_strategies = False
-        if category in {1, 3, 4}:
-            should_use_strategies = True
-        elif category is None:
-            should_use_strategies = intent != QueryIntent.TEMPORAL
+        if force_adversarial:
+            premise_check, is_answerable, answer = self.adversarial_generator(
+                user_query=user_input,
+                context=context
+            )
+            if not is_answerable:
+                answer = "Not mentioned in the conversation"
+            thinking = premise_check
+            
+            if thinking:
+                self.lifecycle_manager.process_thinking_async(
+                    user_query=user_input,
+                    thinking_trace=thinking,
+                    final_answer=answer,
+                )
+            
+            self._update_history(user_input, answer)
+            
+            return AMSAgentResponse(
+                answer=answer,
+                thinking=thinking,
+                intent=intent,
+                retrieved_artifacts=len(artifacts),
+                reasoning_applied=False,
+                artifact_summaries=artifact_summaries,
+                metadata={
+                    "filters": retrieval_metadata.get("filters", {}),
+                    "semantic_query": retrieval_metadata.get("semantic_query", ""),
+                    "retrieval": retrieval_metadata,
+                    "artifact_summaries": artifact_summaries,
+                    "premise_check": premise_check,
+                    "is_answerable": is_answerable,
+                }
+            )
         
+        # =========================================
+        # Step 2: Check if question is answerable (premise check)
+        # =========================================
+        premise_check, is_answerable, _ = self.adversarial_generator(
+            user_query=user_input,
+            context=context
+        )
+        
+        # If not answerable, return early
+        if not is_answerable:
+            self._update_history(user_input, "Not mentioned in the conversation")
+            return AMSAgentResponse(
+                answer="Not mentioned in the conversation",
+                thinking=premise_check,
+                intent=intent,
+                retrieved_artifacts=len(artifacts),
+                reasoning_applied=False,
+                artifact_summaries=artifact_summaries,
+                metadata={
+                    "filters": retrieval_metadata.get("filters", {}),
+                    "semantic_query": retrieval_metadata.get("semantic_query", ""),
+                    "retrieval": retrieval_metadata,
+                    "artifact_summaries": artifact_summaries,
+                    "premise_check": premise_check,
+                    "is_answerable": False,
+                }
+            )
+        
+        # =========================================
+        # Step 3: Retrieve reasoning strategies (skip for temporal intent)
+        # =========================================
         strategies_context = ""
         reasoning_applied = False
-        if should_use_strategies:
+        if intent != QueryIntent.TEMPORAL:
             goal_category = self._intent_to_goal_category(intent)
             strategies = self.retrieval_engine.retrieve_for_reasoning(
                 goal_category=goal_category,
@@ -395,15 +443,17 @@ class AMSAgent(dspy.Module):
             reasoning_applied = len(strategies) > 0
         
         # =========================================
-        # Step 4: Generation with CoT
+        # Step 4: Generation with CoT (routed by intent)
         # =========================================
         thinking, answer = self._generate_answer(
             user_query=user_input,
             context=context,
             intent=intent,
             strategies=strategies_context,
-            category=category
         )
+        
+        # Prepend premise check to thinking trace
+        full_thinking = f"Premise check: {premise_check}\n\n{thinking}"
         
         # =========================================
         # Step 5: Async Lifecycle - Extract artifacts
@@ -412,7 +462,7 @@ class AMSAgent(dspy.Module):
             # Process thinking trace asynchronously
             self.lifecycle_manager.process_thinking_async(
                 user_query=user_input,
-                thinking_trace=thinking,
+                thinking_trace=full_thinking,
                 final_answer=answer,
             )
         
@@ -421,7 +471,7 @@ class AMSAgent(dspy.Module):
         
         return AMSAgentResponse(
             answer=answer,
-            thinking=thinking,
+            thinking=full_thinking,
             intent=intent,
             retrieved_artifacts=len(artifacts),
             reasoning_applied=reasoning_applied,
@@ -431,6 +481,8 @@ class AMSAgent(dspy.Module):
                 "semantic_query": retrieval_metadata.get("semantic_query", ""),
                 "retrieval": retrieval_metadata,
                 "artifact_summaries": artifact_summaries,
+                "premise_check": premise_check,
+                "is_answerable": True,
             }
         )
     
@@ -440,26 +492,18 @@ class AMSAgent(dspy.Module):
         context: str,
         intent: QueryIntent,
         strategies: str,
-        category: Optional[int] = None
     ) -> Tuple[str, str]:
         """
         Generate answer based on intent type.
         
+        Note: Answerability check is done before this method is called.
+        This method only handles answerable questions routed by intent.
+        
         Returns:
             Tuple of (thinking_trace, answer)
         """
-        # Handle adversarial (category 5)
-        if category == 5:
-            premise_check, is_answerable, answer = self.adversarial_generator(
-                user_query=user_query,
-                context=context
-            )
-            if not is_answerable:
-                return premise_check, "Not mentioned in the conversation"
-            return premise_check, answer
-        
         # Handle multi-hop
-        if intent == QueryIntent.MULTI_HOP or category == 3:
+        if intent == QueryIntent.MULTI_HOP:
             bridge_reasoning, intermediate, answer = self.multi_hop_generator(
                 user_query=user_query,
                 context=context,
@@ -469,7 +513,7 @@ class AMSAgent(dspy.Module):
             return thinking, answer
         
         # Handle temporal
-        if intent == QueryIntent.TEMPORAL or category == 2:
+        if intent == QueryIntent.TEMPORAL:
             temporal_reasoning, answer = self.temporal_generator(
                 user_query=user_query,
                 context=context
@@ -529,17 +573,6 @@ class AMSAgent(dspy.Module):
         # Trim history
         if len(self.conversation_history) > self.max_history * 2:
             self.conversation_history = self.conversation_history[-self.max_history:]
-    
-    def _map_category_to_intent(self, category: int) -> QueryIntent:
-        """Map LoCoMo category to QueryIntent."""
-        mapping = {
-            1: QueryIntent.FACTUAL,      # Single-hop factual
-            2: QueryIntent.TEMPORAL,      # Temporal reasoning
-            3: QueryIntent.MULTI_HOP,     # Multi-hop
-            4: QueryIntent.FACTUAL,       # Open-domain
-            5: QueryIntent.FACTUAL,       # Adversarial (handled separately)
-        }
-        return mapping.get(category, QueryIntent.FACTUAL)
     
     def _intent_to_goal_category(self, intent: QueryIntent) -> str:
         """Map QueryIntent to goal category for strategy lookup."""
