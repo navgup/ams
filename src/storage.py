@@ -333,10 +333,6 @@ class ArtifactStore:
                 if not any(tag in artifact.topic_tags for tag in filters.topic_tags):
                     continue
             
-            # Entity name filter
-            # if filters.entity_name and hasattr(artifact, 'name'):
-            #     if filters.entity_name.lower() not in artifact.name.lower():
-            #         continue
             
             # Validity status filter
             if filters.validity_status and hasattr(artifact, 'validity_status'):

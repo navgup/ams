@@ -80,7 +80,7 @@ class ContextSelectorSignature(dspy.Signature):
     - Outdated information (when newer versions exist)
     - Irrelevant artifacts (even if semantically similar)
     
-    Goal: From ~50 candidates, select 5-10 that actually answer the question.
+    Goal: From ~50 candidates, select 10 that actually answer the question.
     """
     
     user_query: str = dspy.InputField(
@@ -91,7 +91,7 @@ class ContextSelectorSignature(dspy.Signature):
     )
     
     selected_ids: str = dspy.OutputField(
-        desc="Comma-separated list of artifact IDs to keep (5-10 most relevant)"
+        desc="Comma-separated list of artifact IDs to keep (10 most relevant)"
     )
     reasoning: str = dspy.OutputField(
         desc="Brief explanation of selection criteria and why others were excluded"
@@ -366,8 +366,46 @@ class HybridRetrievalEngine:
         metadata["semantic_query"] = semantic_query
         metadata["intent"] = intent.value
         
-        # Perform filtered semantic search
-        if filters.artifact_type or filters.temporal_filter or filters.topic_tags:
+        # Perform semantic search with optional filters
+        if filters.artifact_type:
+            # Blend: take top-N of the requested type, then fill remaining slots with general semantic hits.
+            # This keeps some typed bias while still allowing high-similarity untyped artifacts.
+            target_total = k_stage1
+            type_quota = min(5, target_total)  # top 5 of the requested type
+            
+            type_results = self.store.filtered_search(
+                query=semantic_query,
+                filters=filters,
+                k=target_total * 2  # overfetch for diversity
+            )
+            general_results = self.store.semantic_search(
+                query=semantic_query,
+                k=target_total * 2
+            )
+            
+            combined: List[Tuple[str, float]] = []
+            seen = set()
+            
+            # Add typed hits first
+            for aid, score in type_results:
+                if aid in seen:
+                    continue
+                combined.append((aid, score))
+                seen.add(aid)
+                if len(combined) >= type_quota:
+                    break
+            
+            # Fill remaining with general semantic hits (regardless of type)
+            for aid, score in general_results:
+                if aid in seen:
+                    continue
+                combined.append((aid, score))
+                seen.add(aid)
+                if len(combined) >= target_total:
+                    break
+            
+            search_results = combined
+        elif filters.temporal_filter or filters.topic_tags:
             search_results = self.store.filtered_search(
                 query=semantic_query,
                 filters=filters,
@@ -394,7 +432,8 @@ class HybridRetrievalEngine:
             metadata["hops"] = hop_metadata
         
         # Decide whether to run the expensive ContextSelector
-        use_fast_path = intent == QueryIntent.FACTUAL or len(search_results) <= k_stage2
+        use_fast_path = len(search_results) <= k_stage2
+        #intent == QueryIntent.FACTUAL or
         
         if use_fast_path:
             metadata["retrieval_path"] = "fast"
