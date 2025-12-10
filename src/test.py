@@ -64,6 +64,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ast
 
+# Default number of samples to evaluate (LoCoMo conversations)
+DEFAULT_N_SAMPLES = 10
+
 # Try to load .env file if python-dotenv is available
 try:
     from dotenv import load_dotenv
@@ -869,7 +872,7 @@ def setup_logging(log_file: Optional[str] = None, verbose: bool = False) -> logg
 
 def select_questions(
     samples: List[LoCoMoSample],
-    n_samples: int = 1,
+    n_samples: int = DEFAULT_N_SAMPLES,
     n_questions: Optional[int] = None,
     ratio: Optional[float] = None,
     categories: Optional[List[int]] = None,
@@ -1052,28 +1055,23 @@ Examples:
   # E2E test with A-MEM comparison
   python test.py --dummy --compare_amem
   
-  # Run on 1 sample (default) - all questions from first conversation
-  python test.py
+    # Run on default samples (first 10 conversations)
+    python test.py
+    
+    # Compare AMS vs A-MEM on default samples
+    python test.py --compare_amem
   
-  # Run on 3 samples
-  python test.py --n_samples 3
-  
-  # Compare AMS vs A-MEM on 1 sample
-  python test.py --n_samples 1 --compare_amem
-  
-  # Run on specific categories (temporal + multi-hop) from 2 samples
-  python test.py --n_samples 2 --categories 2 3
+  # Run on specific categories (temporal + multi-hop) from default samples
+  python test.py --categories 2 3
   
   # Use a different model
-  python test.py --model gpt-4o-mini --backend openai --n_samples 1
+  python test.py --model gpt-4o-mini --backend openai
         """
     )
     
     # Dataset options
     parser.add_argument("--dataset", type=str, default="../a-mem/data/locomo10.json",
                         help="Path to LoCoMo dataset")
-    parser.add_argument("--n_samples", type=int, default=1,
-                        help="Number of LoCoMo samples (conversations) to use (default: 1)")
     parser.add_argument("--n_questions", type=int, default=None,
                         help="Number of random questions to evaluate (within selected samples)")
     parser.add_argument("--ratio", type=float, default=None,
@@ -1081,7 +1079,7 @@ Examples:
     parser.add_argument("--categories", type=int, nargs="+", default=None,
                         help="Filter to specific LoCoMo categories (1-5)")
     parser.add_argument("--sample_indices", type=int, nargs="+", default=None,
-                        help="Explicit sample indices to run (overrides n_samples if provided)")
+                        help="Explicit sample indices to run (overrides default selection)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for question selection")
     
@@ -1099,6 +1097,10 @@ Examples:
                         help="Number of candidates in retrieval stage 1")
     parser.add_argument("--k_stage2", type=int, default=10,
                         help="Number of final context items")
+    
+    # A-MEM options
+    parser.add_argument("--amem_k", type=int, default=10,
+                        help="Number of memories to retrieve in A-MEM baseline")
     
     # Comparison options
     parser.add_argument("--compare_amem", action="store_true",
@@ -1178,14 +1180,14 @@ Examples:
         # Select questions
         questions = select_questions(
             samples,
-            n_samples=args.n_samples,
+            n_samples=DEFAULT_N_SAMPLES,
             n_questions=args.n_questions,
             ratio=args.ratio,
             categories=args.categories,
             sample_indices=args.sample_indices,
             seed=args.seed
         )
-        logger.info(f"Using {args.n_samples} sample(s), selected {len(questions)} questions for evaluation")
+        logger.info(f"Using {DEFAULT_N_SAMPLES} sample(s), selected {len(questions)} questions for evaluation")
     
     if args.categories:
         logger.info(f"Filtering to categories: {args.categories}")
@@ -1239,6 +1241,7 @@ Examples:
         amem_evaluator = AMEMEvaluator(
             model=args.model,
             backend=args.backend,
+            retrieve_k=args.amem_k,
         )
         
         if amem_evaluator.available:

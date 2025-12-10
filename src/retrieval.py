@@ -8,7 +8,6 @@ Implements a two-stage retrieval process:
 Uses DSPy Signatures and Modules for all cognitive components.
 No raw prompt strings - everything is declarative.
 """
-
 from __future__ import annotations
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
@@ -27,6 +26,11 @@ from schemas import (
 )
 from storage import ArtifactStore
 
+# ============================================================================
+# Defaults (configurable)
+# ============================================================================
+K_STAGE1_DEFAULT = 50  # candidates in stage 1
+K_STAGE2_DEFAULT = 10  # final selected artifacts
 
 # ============================================================================
 # DSPy Signatures
@@ -91,7 +95,7 @@ class ContextSelectorSignature(dspy.Signature):
     )
     
     selected_ids: str = dspy.OutputField(
-        desc="Comma-separated list of artifact IDs to keep (10 most relevant)"
+        desc=f"Comma-separated list of artifact IDs to keep ({K_STAGE2_DEFAULT} most relevant)"
     )
     reasoning: str = dspy.OutputField(
         desc="Brief explanation of selection criteria and why others were excluded"
@@ -208,10 +212,10 @@ class QueryRouter(dspy.Module):
 
 
 class ContextSelector(dspy.Module):
-    """
+    f"""
     Selects the most relevant artifacts from candidates.
     
-    Given ~50 semantic search results, filters down to 5-10 that:
+    Given ~{K_STAGE1_DEFAULT} semantic search results, filters down to {K_STAGE2_DEFAULT} that:
     - Actually answer the question
     - Are not duplicates
     - Are current (not outdated)
@@ -335,8 +339,8 @@ class HybridRetrievalEngine:
         self,
         user_query: str,
         conversation_context: str = "",
-        k_stage1: int = 50,
-        k_stage2: int = 10
+        k_stage1: int = K_STAGE1_DEFAULT,
+        k_stage2: int = K_STAGE2_DEFAULT
     ) -> Tuple[List[Artifact], Dict[str, Any]]:
         """
         Perform two-stage retrieval.
@@ -371,7 +375,7 @@ class HybridRetrievalEngine:
             # Blend: take top-N of the requested type, then fill remaining slots with general semantic hits.
             # This keeps some typed bias while still allowing high-similarity untyped artifacts.
             target_total = k_stage1
-            type_quota = min(5, target_total)  # top 5 of the requested type
+            type_quota = min(int(K_STAGE2_DEFAULT / 2), target_total)  # top 5 of the requested type
             
             type_results = self.store.filtered_search(
                 query=semantic_query,
