@@ -80,7 +80,7 @@ class ContextSelectorSignature(dspy.Signature):
     - Outdated information (when newer versions exist)
     - Irrelevant artifacts (even if semantically similar)
     
-    Goal: From ~50 candidates, select 5-10 that actually answer the question.
+    Goal: From ~50 candidates, select 10 that actually answer the question.
     """
     
     user_query: str = dspy.InputField(
@@ -91,7 +91,7 @@ class ContextSelectorSignature(dspy.Signature):
     )
     
     selected_ids: str = dspy.OutputField(
-        desc="Comma-separated list of artifact IDs to keep (5-10 most relevant)"
+        desc="Comma-separated list of artifact IDs to keep (10 most relevant)"
     )
     reasoning: str = dspy.OutputField(
         desc="Brief explanation of selection criteria and why others were excluded"
@@ -432,7 +432,8 @@ class HybridRetrievalEngine:
             metadata["hops"] = hop_metadata
         
         # Decide whether to run the expensive ContextSelector
-        use_fast_path = intent == QueryIntent.FACTUAL or len(search_results) <= k_stage2
+        use_fast_path = len(search_results) <= k_stage2
+        #intent == QueryIntent.FACTUAL or
         
         if use_fast_path:
             metadata["retrieval_path"] = "fast"

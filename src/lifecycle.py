@@ -90,24 +90,28 @@ class ReasoningExtractorSignature(dspy.Signature):
 
 
 class EventExtractorSignature(dspy.Signature):
-    """Extract events with timestamps from text."""
+    """Extract events with timestamps from text. Store as much of the original context as possible. Natural date text is the original/natural text describing the date (e.g., '2 weeks before June 1'). """
     
     text: str = dspy.InputField(desc="Text to extract events from")
     reference_date: str = dspy.InputField(desc="Reference date for relative time parsing (ISO format)")
     
     events: str = dspy.OutputField(
-        desc="JSON list of events: [{description, timestamp (ISO), duration, location}]"
+        desc="JSON list of events: [{description, timestamp (ISO), natural_date_text, duration, location, entities}]"
     )
 
 
 class FactExtractorSignature(dspy.Signature):
-    """Extract atomic facts from text."""
+    """
+    Extract detailed facts and informational pieces from text.
+    
+    Include as many details as possible from the original context. Treat
+    descriptive information (not only explicit claims) as facts too.
+    """
     
     text: str = dspy.InputField(desc="Text to extract facts from")
-    source_context: str = dspy.InputField(desc="Context about the source of this information")
     
     facts: str = dspy.OutputField(
-        desc="JSON list of facts: [{claim, topic_tags, confidence}]"
+        desc="JSON list of facts: [{claim, topic_tags, entities}]"
     )
 
 
@@ -256,6 +260,7 @@ class EventExtractor(dspy.Module):
             
             description = event.get("description", "").strip()
             timestamp_str = event.get("timestamp", "").strip()
+            natural_date_text = event.get("natural_date_text", "")
             
             if not description or not timestamp_str:
                 continue
@@ -279,6 +284,7 @@ class EventExtractor(dspy.Module):
             artifacts.append(EventArtifact(
                 description=description,
                 timestamp=timestamp,
+                natural_date_text=natural_date_text.strip() or None,
                 duration=event.get("duration"),
                 location=event.get("location"),
             ))
@@ -296,21 +302,19 @@ class FactExtractor(dspy.Module):
     def forward(
         self,
         text: str,
-        source_context: str = ""
     ) -> List[FactArtifact]:
         """
         Extract facts from text.
         
         Args:
             text: Text to extract from
-            source_context: Context about the source
             
         Returns:
             List of FactArtifacts
         """
         result = self.extractor(
             text=text,
-            source_context=source_context or "Extracted from conversation"
+            source_context="",
         )
         
         try:
@@ -327,18 +331,10 @@ class FactExtractor(dspy.Module):
             if not claim:
                 continue
             
-            confidence = fact.get("confidence", 1.0)
-            try:
-                confidence = float(confidence)
-                confidence = max(0.0, min(1.0, confidence))
-            except (ValueError, TypeError):
-                confidence = 1.0
-            
             artifacts.append(FactArtifact(
                 claim=claim,
                 topic_tags=fact.get("topic_tags", []),
-                confidence_score=confidence,
-                source_context=source_context,
+                entity_tags=fact.get("entities", [])
             ))
         
         return artifacts
@@ -656,6 +652,11 @@ class LifecycleManager:
             reference_date=turn_timestamp
         )
         for event in events:
+            # Merge entities from extractor and speaker
+            entity_tags = set(event.entity_tags or [])
+            if speaker:
+                entity_tags.add(speaker)
+            event.entity_tags = list(entity_tags)
             event.provenance_id = saved_turn.id
             saved = self.store.save_artifact(event)
             extracted.append(saved)
@@ -663,10 +664,13 @@ class LifecycleManager:
         
         # Extract facts
         facts = self.fact_extractor(
-            text=content,
-            source_context=f"Stated by {speaker}"
+            text=content
         )
         for fact in facts:
+            entity_tags = set(fact.entity_tags or [])
+            if speaker:
+                entity_tags.add(speaker)
+            fact.entity_tags = list(entity_tags)
             fact.provenance_id = saved_turn.id
             saved = self.store.save_artifact(fact)
             extracted.append(saved)

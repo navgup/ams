@@ -383,18 +383,22 @@ class AMSEvaluator:
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
     
-    def ingest_sample(self, sample: LoCoMoSample, cache_path: Optional[Path] = None) -> int:
+    def ingest_sample(self, sample: LoCoMoSample, cache_path: Optional[Path] = None, preload_path: Optional[Path] = None) -> int:
         """
         Ingest all conversation turns from a sample into the agent.
         
         Args:
             sample: The LoCoMo sample
             cache_path: Optional path to cache/load from
+            preload_path: Optional path to preloaded artifacts (artifacts.json, indices, embeddings)
             
         Returns:
             Number of artifacts extracted
         """
-        # Try to load from cache
+        # Try to load from preload dir (artifacts saved earlier) or cache
+        if preload_path and preload_path.exists():
+            self.agent.load(preload_path)
+            return self.agent.store.get_stats()["total_artifacts"]
         if cache_path and cache_path.exists():
             self.agent.load(cache_path)
             return self.agent.store.get_stats()["total_artifacts"]
@@ -460,8 +464,7 @@ class AMSEvaluator:
             Tuple of (prediction, thinking, retrieved_count, intent, artifact_summaries, retrieval_path, reasoning_applied)
         """
         try:
-            force_adversarial = (qa.category == 5)
-            response = self.agent(qa.question, force_adversarial=force_adversarial)
+            response = self.agent(qa.question, category=qa.category)
             # Extract retrieval_path from metadata if available
             retrieval_path = None
             if hasattr(response, "metadata") and response.metadata:
@@ -487,6 +490,7 @@ class AMSEvaluator:
         questions: Optional[List[Tuple[int, QA]]] = None,
         cache_dir: Optional[Path] = None,
         artifact_dir: Optional[Path] = None,
+        load_artifacts_dir: Optional[Path] = None,
         logger: Optional[logging.Logger] = None,
     ) -> EvaluationResults:
         """
@@ -532,10 +536,11 @@ class AMSEvaluator:
             # Create new agent for this sample
             self.agent = self._create_agent()
             
-            # Ingest sample
+            # Ingest sample (or load pre-saved artifacts)
             cache_path = cache_dir / f"sample_{sample_idx}" if cache_dir else None
+            preload_path = load_artifacts_dir / f"sample_{sample_idx}" if load_artifacts_dir else None
             try:
-                extracted = self.ingest_sample(sample, cache_path)
+                extracted = self.ingest_sample(sample, cache_path, preload_path)
                 log.info(f"Sample {sample_idx}: ingested {extracted} artifacts")
                 total_generated_artifacts += extracted
             except Exception as e:
@@ -773,7 +778,7 @@ class AMEMEvaluator:
         # Retrieve context
         context = memory_system.find_related_memories_raw(qa.question, k=self.retrieve_k)
         
-        # Generate answer (simplified - using the memory system's LLM)
+        # Category-specific prompting (mirrors AMS fairness)
         if qa.category == 5:
             prompt = f"""You must determine whether the question can be answered from the provided conversation context.
             
@@ -786,10 +791,22 @@ class AMEMEvaluator:
             If the context does NOT contain the necessary information or contradicts the question's premise, return ONLY 'Not mentioned in the conversation'.
             
             Answer:"""
-        else:
-            prompt = f"""Based on the context: {context}
+        elif qa.category == 2:
+            prompt = f"""
+            Based on the context: {context}, answer the following question. Use the dates/phrasing from the context; keep the answer short and avoid adding subjects.
             
-            Answer the following question. Return ONLY the direct answer - concise, no explanations.
+            Question: {qa.question}
+            
+            Answer:"""
+        elif qa.category == 3:
+            prompt = f"""
+            Based on the context: {context}, write an answer as a short phrase. Use exact words from the context whenever possible.
+            
+            Question: {qa.question}
+            
+            Answer:"""
+        else:
+            prompt = f"""Based on the context: {context}, write an answer as a short phrase. Use exact words from the context whenever possible.
             
             Question: {qa.question}
             
@@ -856,6 +873,7 @@ def select_questions(
     n_questions: Optional[int] = None,
     ratio: Optional[float] = None,
     categories: Optional[List[int]] = None,
+    sample_indices: Optional[List[int]] = None,
     seed: int = 42
 ) -> List[Tuple[int, QA]]:
     """
@@ -874,12 +892,15 @@ def select_questions(
     """
     random.seed(seed)
     
-    # Limit to first n_samples
-    n_samples = min(n_samples, len(samples))
+    # Determine which sample indices to include
+    if sample_indices is not None:
+        selected_indices = sorted(set(i for i in sample_indices if 0 <= i < len(samples)))
+    else:
+        selected_indices = list(range(min(n_samples, len(samples))))
     
     # Collect all questions from the selected samples
     all_questions = []
-    for sample_idx in range(n_samples):
+    for sample_idx in selected_indices:
         sample = samples[sample_idx]
         for qa in sample.qa:
             if categories is None or qa.category in categories:
@@ -1059,6 +1080,8 @@ Examples:
                         help="Ratio of questions to evaluate (0.0 to 1.0)")
     parser.add_argument("--categories", type=int, nargs="+", default=None,
                         help="Filter to specific LoCoMo categories (1-5)")
+    parser.add_argument("--sample_indices", type=int, nargs="+", default=None,
+                        help="Explicit sample indices to run (overrides n_samples if provided)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for question selection")
     
@@ -1088,6 +1111,8 @@ Examples:
                         help="Directory to cache ingested samples (default: <script_dir>/cache)")
     parser.add_argument("--artifact_dir", type=str, default=None,
                         help="Directory to save AMS artifacts per sample (default: <script_dir>/artifacts)")
+    parser.add_argument("--load_artifacts_dir", type=str, default=None,
+                        help="Directory of pre-saved AMS artifacts per sample (artifacts.json, indices, embeddings). If provided, ingestion is skipped for samples found here.")
     parser.add_argument("--log_file", type=str, default=None,
                         help="Path to log file")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -1132,6 +1157,7 @@ Examples:
     base_dir = Path(__file__).parent
     cache_dir = Path(args.cache_dir) if args.cache_dir else (base_dir / "cache")
     artifact_dir = Path(args.artifact_dir) if args.artifact_dir else (base_dir / "artifacts")
+    load_artifacts_dir = Path(args.load_artifacts_dir) if args.load_artifacts_dir else None
     output_path = Path(args.output) if args.output else None
     
     # Load dataset (or use dummy for end-to-end testing)
@@ -1156,6 +1182,7 @@ Examples:
             n_questions=args.n_questions,
             ratio=args.ratio,
             categories=args.categories,
+            sample_indices=args.sample_indices,
             seed=args.seed
         )
         logger.info(f"Using {args.n_samples} sample(s), selected {len(questions)} questions for evaluation")
@@ -1198,6 +1225,7 @@ Examples:
         questions=questions,
         cache_dir=cache_dir / "ams" if cache_dir else None,
         artifact_dir=artifact_dir,
+        load_artifacts_dir=load_artifacts_dir,
         logger=logger,
     )
     

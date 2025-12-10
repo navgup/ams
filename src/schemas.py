@@ -164,6 +164,14 @@ class EventArtifact(Artifact):
         default_factory=list,
         description="IDs of entities involved in this event"
     )
+    entity_tags: List[str] = Field(
+        default_factory=list,
+        description="Entities this event involves (include speaker and referenced entities)"
+    )
+    natural_date_text: Optional[str] = Field(
+        default=None,
+        description="Original/natural text describing the date (e.g., '2 weeks before June 1')"
+    )
     duration: Optional[str] = Field(
         default=None,
         description="Duration of the event (e.g., '2 hours', '3 days')"
@@ -183,6 +191,10 @@ class EventArtifact(Artifact):
             self.description,
             f"Date: {self.timestamp.strftime('%Y-%m-%d %H:%M')}"
         ]
+        if self.natural_date_text:
+            parts.append(f"Natural date: {self.natural_date_text}")
+        if self.entity_tags:
+            parts.append(f"Entities: {', '.join(self.entity_tags)}")
         if self.duration:
             parts.append(f"Duration: {self.duration}")
         if self.location:
@@ -200,6 +212,10 @@ class EventArtifact(Artifact):
         """Convert to LLM context string."""
         lines = [f"Event: {self.description}"]
         lines.append(f"Date: {self.timestamp.strftime('%Y-%m-%d %H:%M')}")
+        if self.natural_date_text:
+            lines.append(f"Natural date: {self.natural_date_text}")
+        if self.entity_tags:
+            lines.append(f"Entities: {', '.join(self.entity_tags)}")
         if self.duration:
             lines.append(f"Duration: {self.duration}")
         if self.location:
@@ -223,13 +239,13 @@ class FactArtifact(Artifact):
         ...,
         description="The factual claim or statement"
     )
+    entity_tags: List[str] = Field(
+        default_factory=list,
+        description="Entities this fact applies to (include speaker and referenced entities)"
+    )
     source_url: Optional[str] = Field(
         default=None,
         description="Source URL if from external reference"
-    )
-    source_context: Optional[str] = Field(
-        default=None,
-        description="Context where this fact was established"
     )
     validity_status: ValidityStatus = Field(
         default=ValidityStatus.VERIFIED,
@@ -238,12 +254,6 @@ class FactArtifact(Artifact):
     topic_tags: List[str] = Field(
         default_factory=list,
         description="Topic tags for categorization and retrieval"
-    )
-    confidence_score: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description="Confidence in this fact (0.0 to 1.0)"
     )
     conflicting_fact_ids: List[str] = Field(
         default_factory=list,
@@ -259,6 +269,8 @@ class FactArtifact(Artifact):
         parts = [self.claim]
         if self.topic_tags:
             parts.append(f"Topics: {', '.join(self.topic_tags)}")
+        if self.entity_tags:
+            parts.append(f"Entities: {', '.join(self.entity_tags)}")
         parts.append(f"Status: {self.validity_status.value}")
         return " | ".join(parts)
     
@@ -272,8 +284,8 @@ class FactArtifact(Artifact):
         lines.append(f"Status: {self.validity_status.value}")
         if self.topic_tags:
             lines.append(f"Topics: {', '.join(self.topic_tags)}")
-        if self.confidence_score < 1.0:
-            lines.append(f"Confidence: {self.confidence_score:.0%}")
+        if self.entity_tags:
+            lines.append(f"Entities: {', '.join(self.entity_tags)}")
         return "\n".join(lines)
 
 
